@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,14 +19,19 @@ import (
 type fakeCollector struct {
 	capability protocol.Capability
 	deltas     []protocol.IfaceDelta
+	proxy      *protocol.ProxyDelta
+	err        error
 }
 
 func (f fakeCollector) Capability() protocol.Capability {
 	return f.capability
 }
 
-func (f fakeCollector) Collect(context.Context, time.Time) ([]protocol.IfaceDelta, []protocol.Gap, error) {
-	return f.deltas, nil, nil
+func (f fakeCollector) Collect(context.Context, time.Time) (snapshot, error) {
+	if f.err != nil {
+		return snapshot{}, f.err
+	}
+	return snapshot{interfaces: f.deltas, proxy: f.proxy}, nil
 }
 
 func TestDisabledIfaceDoesNotPreventSimReporting(t *testing.T) {
@@ -247,6 +253,138 @@ func TestLoadConfigAndFullBearerToken(t *testing.T) {
 	if token != "lt_credential_secret" {
 		t.Fatalf("token = %q, want full bearer token", token)
 	}
+}
+
+func TestLoadConfigEnablesMihomoFromSecretFile(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	secretPath := filepath.Join(dir, "mihomo.secret")
+	if err := os.WriteFile(tokenPath, []byte("lt_credential_secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secretPath, []byte("local-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "agent.json")
+	raw := `{
+		"server_url":"https://collector.example.test",
+		"site_id":"site-test",
+		"node_id":"node-test",
+		"token_file":` + mustJSON(t, tokenPath) + `,
+		"collectors":{"iface":true,"mihomo":true},
+		"mihomo":{"url":"http://127.0.0.1:9090","secret_file":` + mustJSON(t, secretPath) + `}
+	}`
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Collectors.Mihomo || cfg.Mihomo.URL != "http://127.0.0.1:9090" || cfg.Mihomo.SecretFile != secretPath {
+		t.Fatalf("unexpected mihomo config: %+v", cfg)
+	}
+	secret, err := loadSecret(cfg.Mihomo.SecretFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secret != "local-secret" {
+		t.Fatalf("secret = %q", secret)
+	}
+
+	missingURL := `{
+		"server_url":"https://collector.example.test",
+		"site_id":"site-test",
+		"node_id":"node-test",
+		"token_file":` + mustJSON(t, tokenPath) + `,
+		"collectors":{"mihomo":true}
+	}`
+	if err := os.WriteFile(configPath, []byte(missingURL), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(configPath); err == nil {
+		t.Fatal("expected error when mihomo is enabled without url")
+	}
+}
+
+func TestCollectMergesMihomoProxyWithoutDroppingIface(t *testing.T) {
+	var cfg Config
+	cfg.SiteID = "site-test"
+	cfg.NodeID = "node-test"
+	cfg.Interval = 15 * time.Second
+	cfg.Collectors.Iface = true
+	cfg.Collectors.Mihomo = true
+
+	a := newAgent(cfg, "boot-test", map[string]collector{
+		"iface": fakeCollector{
+			capability: protocol.CapIface,
+			deltas:     []protocol.IfaceDelta{{Name: "eth0", RxDelta: 10, TxDelta: 4}},
+		},
+		"mihomo": fakeCollector{
+			capability: protocol.CapMihomo,
+			proxy: &protocol.ProxyDelta{
+				ByOutbound: []protocol.OutboundDelta{
+					{Name: "DIRECT", DirectRx: 3, DirectTx: 1},
+					{Name: "ss-test", ProxyRx: 7, ProxyTx: 2},
+				},
+			},
+		},
+	})
+	batch := a.collect(context.Background(), time.Unix(1_700_000_000, 0).UTC())
+	if !hasCapability(batch.Capabilities, protocol.CapIface) || !hasCapability(batch.Capabilities, protocol.CapMihomo) {
+		t.Fatalf("capabilities = %+v", batch.Capabilities)
+	}
+	if len(batch.Interfaces) != 1 || batch.Interfaces[0].Name != "eth0" {
+		t.Fatalf("iface missing: %+v", batch.Interfaces)
+	}
+	if batch.Proxy == nil || len(batch.Proxy.ByOutbound) != 2 {
+		t.Fatalf("proxy missing: %+v", batch.Proxy)
+	}
+}
+
+func TestMihomoCollectErrorKeepsIfaceAndRecordsGap(t *testing.T) {
+	var cfg Config
+	cfg.SiteID = "site-test"
+	cfg.NodeID = "node-test"
+	cfg.Interval = 15 * time.Second
+	cfg.Collectors.Iface = true
+	cfg.Collectors.Mihomo = true
+
+	a := newAgent(cfg, "boot-test", map[string]collector{
+		"iface": fakeCollector{
+			capability: protocol.CapIface,
+			deltas:     []protocol.IfaceDelta{{Name: "br-lan", RxDelta: 1, TxDelta: 1}},
+		},
+		"mihomo": fakeCollector{
+			capability: protocol.CapMihomo,
+			err:        errors.New("mihomo unavailable"),
+		},
+	})
+	batch := a.collect(context.Background(), time.Unix(1_700_000_000, 0).UTC())
+	if len(batch.Interfaces) != 1 {
+		t.Fatalf("iface should survive mihomo error: %+v", batch.Interfaces)
+	}
+	if batch.Proxy != nil {
+		t.Fatalf("proxy should be absent on collector error: %+v", batch.Proxy)
+	}
+	foundReset := false
+	for _, gap := range batch.Gaps {
+		if gap.Reason == protocol.GapCollectorReset {
+			foundReset = true
+		}
+	}
+	if !foundReset {
+		t.Fatalf("expected collector_reset gap, got %+v", batch.Gaps)
+	}
+}
+
+func hasCapability(caps []protocol.Capability, want protocol.Capability) bool {
+	for _, cap := range caps {
+		if cap == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPostBatchUsesGzipJSONAndBearerToken(t *testing.T) {

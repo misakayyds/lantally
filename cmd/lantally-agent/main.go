@@ -19,6 +19,7 @@ import (
 	"time"
 
 	ifacecollector "github.com/misakayyds/lantally/internal/collector/iface"
+	mihomocollector "github.com/misakayyds/lantally/internal/collector/mihomo"
 	"github.com/misakayyds/lantally/internal/protocol"
 )
 
@@ -34,7 +35,12 @@ type Config struct {
 	TokenFile  string
 	Interval   time.Duration
 	Collectors struct {
-		Iface bool
+		Iface  bool
+		Mihomo bool
+	}
+	Mihomo struct {
+		URL        string
+		SecretFile string
 	}
 }
 
@@ -45,8 +51,13 @@ type configFile struct {
 	TokenFile  string `json:"token_file"`
 	Interval   string `json:"interval"`
 	Collectors struct {
-		Iface bool `json:"iface"`
+		Iface  bool `json:"iface"`
+		Mihomo bool `json:"mihomo"`
 	} `json:"collectors"`
+	Mihomo struct {
+		URL        string `json:"url"`
+		SecretFile string `json:"secret_file"`
+	} `json:"mihomo"`
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -78,8 +89,19 @@ func LoadConfig(filename string) (Config, error) {
 		Interval:  interval,
 	}
 	cfg.Collectors.Iface = raw.Collectors.Iface
+	cfg.Collectors.Mihomo = raw.Collectors.Mihomo
+	cfg.Mihomo.URL = strings.TrimSpace(raw.Mihomo.URL)
+	cfg.Mihomo.SecretFile = strings.TrimSpace(raw.Mihomo.SecretFile)
 	if cfg.ServerURL == "" || cfg.SiteID == "" || cfg.NodeID == "" || cfg.TokenFile == "" {
 		return Config{}, errors.New("server_url, site_id, node_id, and token_file are required")
+	}
+	if cfg.Collectors.Mihomo && cfg.Mihomo.URL == "" {
+		return Config{}, errors.New("mihomo.url is required when collectors.mihomo is enabled")
+	}
+	if cfg.Collectors.Mihomo {
+		if _, err := url.ParseRequestURI(cfg.Mihomo.URL); err != nil {
+			return Config{}, fmt.Errorf("parse mihomo.url: %w", err)
+		}
 	}
 	if cfg.Interval <= 0 {
 		return Config{}, errors.New("interval must be positive")
@@ -113,9 +135,31 @@ func loadToken(filename string) (string, error) {
 	return token, nil
 }
 
+func loadSecret(filename string) (string, error) {
+	if strings.TrimSpace(filename) == "" {
+		return "", nil
+	}
+	raw, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	secret := strings.TrimSpace(string(raw))
+	if secret == "" || strings.ContainsAny(secret, "\r\n") {
+		return "", errors.New("secret file must contain one line")
+	}
+	return secret, nil
+}
+
+type snapshot struct {
+	interfaces []protocol.IfaceDelta
+	devices    []protocol.DeviceDelta
+	proxy      *protocol.ProxyDelta
+	gaps       []protocol.Gap
+}
+
 type collector interface {
 	Capability() protocol.Capability
-	Collect(context.Context, time.Time) ([]protocol.IfaceDelta, []protocol.Gap, error)
+	Collect(context.Context, time.Time) (snapshot, error)
 }
 
 type namedCollector struct {
@@ -134,8 +178,15 @@ type agent struct {
 func newAgent(config Config, bootID string, available map[string]collector) *agent {
 	a := &agent{config: config, bootID: bootID, firstBatch: true}
 	for name, candidate := range available {
-		if name == "iface" && !config.Collectors.Iface {
-			continue
+		switch name {
+		case "iface":
+			if !config.Collectors.Iface {
+				continue
+			}
+		case "mihomo":
+			if !config.Collectors.Mihomo {
+				continue
+			}
 		}
 		a.collectors = append(a.collectors, namedCollector{name: name, collector: candidate})
 	}
@@ -148,6 +199,38 @@ func newAgentSession(config Config, available map[string]collector) (*agent, err
 		return nil, err
 	}
 	return newAgent(config, id, available), nil
+}
+
+type ifaceAdapter struct {
+	inner *ifacecollector.Collector
+}
+
+func (a ifaceAdapter) Capability() protocol.Capability {
+	return a.inner.Capability()
+}
+
+func (a ifaceAdapter) Collect(ctx context.Context, at time.Time) (snapshot, error) {
+	deltas, gaps, err := a.inner.Collect(ctx, at)
+	if err != nil {
+		return snapshot{}, err
+	}
+	return snapshot{interfaces: deltas, gaps: gaps}, nil
+}
+
+type mihomoAdapter struct {
+	inner *mihomocollector.Collector
+}
+
+func (a mihomoAdapter) Capability() protocol.Capability {
+	return a.inner.Capability()
+}
+
+func (a mihomoAdapter) Collect(ctx context.Context, at time.Time) (snapshot, error) {
+	proxy, gaps, err := a.inner.Collect(ctx, at)
+	if err != nil {
+		return snapshot{}, err
+	}
+	return snapshot{proxy: proxy, gaps: gaps}, nil
 }
 
 func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
@@ -179,7 +262,7 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 			batch.Capabilities = append(batch.Capabilities, capability)
 			seenCapabilities[capability] = struct{}{}
 		}
-		deltas, gaps, err := registered.collector.Collect(ctx, at)
+		snap, err := registered.collector.Collect(ctx, at)
 		if err != nil {
 			batch.Gaps = append(batch.Gaps, protocol.Gap{
 				Reason: protocol.GapCollectorReset,
@@ -188,8 +271,17 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 			})
 			continue
 		}
-		batch.Interfaces = append(batch.Interfaces, deltas...)
-		batch.Gaps = append(batch.Gaps, gaps...)
+		batch.Interfaces = append(batch.Interfaces, snap.interfaces...)
+		batch.Devices = append(batch.Devices, snap.devices...)
+		if snap.proxy != nil && len(snap.proxy.ByOutbound) > 0 {
+			if batch.Proxy == nil {
+				copied := *snap.proxy
+				batch.Proxy = &copied
+			} else {
+				batch.Proxy.ByOutbound = append(batch.Proxy.ByOutbound, snap.proxy.ByOutbound...)
+			}
+		}
+		batch.Gaps = append(batch.Gaps, snap.gaps...)
 	}
 	return batch
 }
@@ -353,7 +445,19 @@ func postBatch(ctx context.Context, client *http.Client, serverURL, token string
 }
 
 func run(ctx context.Context, cfg Config, token string) error {
-	a, err := newAgentSession(cfg, map[string]collector{"iface": ifacecollector.NewCollector()})
+	available := map[string]collector{
+		"iface": ifaceAdapter{inner: ifacecollector.NewCollector()},
+	}
+	if cfg.Collectors.Mihomo {
+		secret, err := loadSecret(cfg.Mihomo.SecretFile)
+		if err != nil {
+			return err
+		}
+		available["mihomo"] = mihomoAdapter{
+			inner: mihomocollector.NewCollector(mihomocollector.NewClient(cfg.Mihomo.URL, secret, nil)),
+		}
+	}
+	a, err := newAgentSession(cfg, available)
 	if err != nil {
 		return err
 	}
