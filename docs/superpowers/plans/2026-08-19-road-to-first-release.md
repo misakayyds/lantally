@@ -1,6 +1,6 @@
 # LanTally 首个可发布版本（v0.1.0）规划
 
-> 状态：R1 已在 `feat/r1-outbound-device-ledgers` 落地（outbound 账本、Mihomo sourceIP 设备归因、nlbwmon 接入 agent 且默认关）。R2–R7 未开始。
+> 状态：R1 已落地；R2 已在 `feat/r2-traffic-query` 落地（`GET /v1/traffic`、自动桶宽、`ledger_daily` 日聚合、samples 保留 14 天）。R3–R7 未开始。
 > 前置：M1–M9 已在 `main` 落地（注册、摄入、身份、账本、Mihomo 采集、嵌入式 UI、72 小时堆叠图、all-in-one 打包）。
 > 本文接替原计划的 M10，展开为 R1–R7。执行时逐个里程碑拆 TDD 步骤。
 
@@ -31,8 +31,8 @@
 | 按设备记账 | Mihomo 对局域网 `sourceIP` 产出设备增量；无 sourceIP 时保持节点级。nlbwmon 开启后提供按设备总量 |
 | 按出口节点（outbound）记账 | **R1 已完成**。`proxy_*` 按 outbound 分列存储，求和等于该类总量 |
 | 倍率折算 | 函数完成，server 无倍率表、无配置入口，`proxy_adjusted` 恒等于原始值 |
-| 时间筛选 / 设备筛选 | 无，固定 72h |
-| 日 / 月历史 | 无聚合表，samples 无保留策略 |
+| 时间筛选 / 设备筛选 | **R2 已完成**。`GET /v1/traffic` 支持 from/to/bucket/group/node/device/class；桶宽 24h/72h=30 分、7d=2 小时、30d=1 天 |
+| 日 / 月历史 | **R2 已完成**。`ledger_daily` 每小时汇总，samples 保留 14 天；30d 查询走 daily |
 | 告警 | 页面占位，评估器未接线 |
 | 对账 | 模板文档有，无 UI |
 | 部署 | 手工交叉编译 + scp + 手写 JSON，全是命令行 |
@@ -55,6 +55,8 @@
 - **验收**：单元测试覆盖「同一批次同时含 nlbwmon 与 Mihomo 时不双计」「outbound 细分求和等于 proxy_raw 总量」「sourceIP 缺失时回退为节点级代理字节」。
 
 ### R2 — 查询 API 与时间/设备筛选
+
+状态：已实现（分支 `feat/r2-traffic-query`）。
 
 - 新增 `GET /v1/traffic`，参数：`from`、`to`、`bucket`、`group`（node/device/outbound/class）、`node`、`device`、`class`。现有三页内嵌的 traffic 字段改为调用同一查询层。
 - 时间范围预设：24h / 72h / 7d / 30d / 自定义；桶宽自动匹配（≤72h 用 30 分钟，7d 用 2 小时，30d 用 1 天）。

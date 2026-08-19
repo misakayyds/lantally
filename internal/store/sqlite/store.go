@@ -126,14 +126,21 @@ func applyMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	if hasOutbound {
-		return nil
+	if !hasOutbound {
+		outboundMigration, err := migrations.ReadFile("migrations/0007_ledger_outbound.sql")
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(string(outboundMigration)); err != nil {
+			return err
+		}
 	}
-	outboundMigration, err := migrations.ReadFile("migrations/0007_ledger_outbound.sql")
+
+	dailyMigration, err := migrations.ReadFile("migrations/0008_ledger_daily.sql")
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(string(outboundMigration))
+	_, err = db.Exec(string(dailyMigration))
 	return err
 }
 

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,7 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/logout", logoutHandler(sessions))
 	mux.HandleFunc("POST /v1/enroll", requireSession(sessions, enrollHandler(store)))
 	mux.HandleFunc("GET /v1/overview", requireSession(sessions, overviewHandler(store)))
+	mux.HandleFunc("GET /v1/traffic", requireSession(sessions, trafficHandler(store)))
 	mux.HandleFunc("GET /v1/devices", requireSession(sessions, devicesHandler(store)))
 	mux.HandleFunc("GET /v1/nodes", requireSession(sessions, nodesHandler(store)))
 	mux.HandleFunc("GET /v1/proxy", requireSession(sessions, proxyHandler(store)))
@@ -280,14 +282,78 @@ func emptyListHandler(name string) http.HandlerFunc {
 }
 
 func lastTraffic(store *sqlitestore.Store, r *http.Request, group, class string) (sqlitestore.TrafficSeries, error) {
+	query, err := parseTrafficQuery(r)
+	if err != nil {
+		return sqlitestore.TrafficSeries{}, err
+	}
+	if r.URL.Query().Get("group") == "" {
+		query.Group = group
+	}
+	if r.URL.Query().Get("class") == "" && class != "" {
+		query.Class = class
+	}
+	return store.TrafficSeries(r.Context(), query)
+}
+
+func trafficHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query, err := parseTrafficQuery(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		series, err := store.TrafficSeries(r.Context(), query)
+		if err != nil {
+			http.Error(w, "traffic unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(series)
+	}
+}
+
+func parseTrafficQuery(r *http.Request) (sqlitestore.TrafficQuery, error) {
+	values := r.URL.Query()
+	group := values.Get("group")
+	if group == "" {
+		group = "node"
+	}
+	switch group {
+	case "node", "device", "outbound", "class":
+	default:
+		return sqlitestore.TrafficQuery{}, fmt.Errorf("invalid group")
+	}
+
 	now := time.Now().UTC()
-	return store.TrafficSeries(r.Context(), sqlitestore.TrafficQuery{
-		From:          now.Add(-72 * time.Hour),
-		To:            now,
-		BucketSeconds: 1800,
-		Group:         group,
-		Class:         class,
-	})
+	query := sqlitestore.TrafficQuery{
+		From:     now.Add(-72 * time.Hour),
+		To:       now,
+		Group:    group,
+		Class:    values.Get("class"),
+		NodeID:   values.Get("node"),
+		DeviceID: values.Get("device"),
+	}
+	if raw := values.Get("from"); raw != "" {
+		from, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return sqlitestore.TrafficQuery{}, fmt.Errorf("invalid from")
+		}
+		query.From = from.UTC()
+	}
+	if raw := values.Get("to"); raw != "" {
+		to, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return sqlitestore.TrafficQuery{}, fmt.Errorf("invalid to")
+		}
+		query.To = to.UTC()
+	}
+	if raw := values.Get("bucket"); raw != "" {
+		bucket, err := strconv.Atoi(raw)
+		if err != nil || bucket <= 0 {
+			return sqlitestore.TrafficQuery{}, fmt.Errorf("invalid bucket")
+		}
+		query.BucketSeconds = bucket
+	}
+	return query, nil
 }
 
 // EnsureFirstRunAdmin creates a one-time admin password when none exists.

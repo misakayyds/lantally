@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misakayyds/lantally/internal/collector/sim"
 	"github.com/misakayyds/lantally/internal/enroll"
@@ -181,5 +182,85 @@ func TestOverviewShowsLedgerBytesAfterIngest(t *testing.T) {
 	}
 	if len(devicesBody.Devices) != 1 {
 		t.Fatalf("devices = %+v", devicesBody.Devices)
+	}
+}
+
+func TestTrafficEndpointHonorsRangeAndGroup(t *testing.T) {
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "lantally.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateAdminCredential("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	handler := Routes(store, Config{})
+
+	unauth := httptest.NewRequest(http.MethodGet, "/v1/traffic", nil)
+	unauthRec := httptest.NewRecorder()
+	handler.ServeHTTP(unauthRec, unauth)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("traffic without login = %d", unauthRec.Code)
+	}
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/v1/login", strings.NewReader(`{"password":"test-password"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRec := httptest.NewRecorder()
+	handler.ServeHTTP(loginRec, loginReq)
+	cookie := loginRec.Result().Cookies()[0]
+
+	enrollReq := httptest.NewRequest(http.MethodPost, "/v1/enroll", strings.NewReader(`{"site_id":"sim-site","node_id":"sim-node"}`))
+	enrollReq.Header.Set("Content-Type", "application/json")
+	enrollReq.AddCookie(cookie)
+	enrollRec := httptest.NewRecorder()
+	handler.ServeHTTP(enrollRec, enrollReq)
+	var issued struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(enrollRec.Body.Bytes())).Decode(&issued); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := protocol.Encode(sim.Snapshot(1, "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingestReq := httptest.NewRequest(http.MethodPost, "/v1/ingest", bytes.NewReader(raw))
+	ingestReq.Header.Set("Authorization", "Bearer "+issued.Token)
+	ingestReq.Header.Set("Content-Encoding", "gzip")
+	ingestReq.Header.Set("Content-Type", "application/json")
+	if rec := httptest.NewRecorder(); true {
+		handler.ServeHTTP(rec, ingestReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ingest = %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	to := time.Now().UTC()
+	from := to.Add(-24 * time.Hour)
+	path := "/v1/traffic?from=" + from.Format(time.RFC3339) + "&to=" + to.Format(time.RFC3339) + "&group=node&class=total"
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("traffic = %d %s", rec.Code, rec.Body.String())
+	}
+	var series sqlitestore.TrafficSeries
+	if err := json.NewDecoder(bytes.NewReader(rec.Body.Bytes())).Decode(&series); err != nil {
+		t.Fatal(err)
+	}
+	if series.BucketSeconds != 1800 {
+		t.Fatalf("bucket = %d, want 1800 for 24h", series.BucketSeconds)
+	}
+	if series.Totals["sim-node"] != 1536 {
+		t.Fatalf("totals = %+v, want sim-node 1536", series.Totals)
+	}
+
+	bad := httptest.NewRequest(http.MethodGet, "/v1/traffic?group=unknown", nil)
+	bad.AddCookie(cookie)
+	badRec := httptest.NewRecorder()
+	handler.ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown group = %d, want 400", badRec.Code)
 	}
 }

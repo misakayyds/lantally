@@ -364,3 +364,137 @@ func TestTrafficSeriesBucketsNodeTotals(t *testing.T) {
 		t.Fatalf("proxy-20 buckets = %+v", got)
 	}
 }
+
+func TestDefaultBucketSecondsMatchesRange(t *testing.T) {
+	to := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	if got := DefaultBucketSeconds(to.Add(-24*time.Hour), to); got != 1800 {
+		t.Fatalf("24h bucket = %d, want 1800", got)
+	}
+	if got := DefaultBucketSeconds(to.Add(-72*time.Hour), to); got != 1800 {
+		t.Fatalf("72h bucket = %d, want 1800", got)
+	}
+	if got := DefaultBucketSeconds(to.Add(-7*24*time.Hour), to); got != 7200 {
+		t.Fatalf("7d bucket = %d, want 7200", got)
+	}
+	if got := DefaultBucketSeconds(to.Add(-30*24*time.Hour), to); got != 86400 {
+		t.Fatalf("30d bucket = %d, want 86400", got)
+	}
+}
+
+func TestRollupDailyIsIdempotentAndSurvivesSamplePurge(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-20 * 24 * time.Hour)
+	recent := now.Add(-2 * time.Hour)
+
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 1, old, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 1000, Tx: 500},
+		{Class: accounting.ClassProxyRaw, Outbound: "ss-test", Rx: 200, Tx: 50},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 2, recent, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 80, Tx: 20},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RollupDaily(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollupDaily(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+
+	day := time.Date(old.Year(), old.Month(), old.Day(), 0, 0, 0, 0, time.UTC).Unix()
+	var rx, tx int64
+	err := store.db.QueryRowContext(
+		ctx,
+		`SELECT rx, tx FROM ledger_daily
+		 WHERE day = ? AND node_id = ? AND device_id = '' AND class = ? AND outbound = ''`,
+		day, "proxy-20", accounting.ClassTotal,
+	).Scan(&rx, &tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rx != 1000 || tx != 500 {
+		t.Fatalf("daily total = rx=%d tx=%d, want 1000/500 after idempotent rollup", rx, tx)
+	}
+
+	if err := store.PurgeSamples(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+
+	series, err := store.TrafficSeries(ctx, TrafficQuery{
+		From: now.Add(-30 * 24 * time.Hour),
+		To:   now,
+		Group: "node",
+		Class: accounting.ClassTotal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if series.BucketSeconds != 86400 {
+		t.Fatalf("30d bucket = %d, want 86400", series.BucketSeconds)
+	}
+	if series.Totals["proxy-20"] != 1600 {
+		t.Fatalf("30d totals = %+v, want old 1500 + recent 100", series.Totals)
+	}
+
+	short, err := store.TrafficSeries(ctx, TrafficQuery{
+		From: now.Add(-72 * time.Hour),
+		To:   now,
+		Group: "node",
+		Class: accounting.ClassTotal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if short.BucketSeconds != 1800 {
+		t.Fatalf("72h bucket = %d, want 1800", short.BucketSeconds)
+	}
+	if short.Totals["proxy-20"] != 100 {
+		t.Fatalf("72h after purge should keep recent samples only, got %+v", short.Totals)
+	}
+}
+
+func TestTrafficSeriesFiltersNodeAndDevice(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	at := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 1, at, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 100, Tx: 0},
+		{DeviceID: "dev-a", Class: accounting.ClassTotal, Rx: 40, Tx: 0},
+		{DeviceID: "dev-b", Class: accounting.ClassTotal, Rx: 60, Tx: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "dns-21", "boot-b", 1, at, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 9, Tx: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	byNode, err := store.TrafficSeries(ctx, TrafficQuery{
+		From: at.Add(-time.Hour), To: at.Add(time.Hour),
+		Group: "node", Class: accounting.ClassTotal, NodeID: "proxy-20",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byNode.Totals["proxy-20"] != 100 || byNode.Totals["dns-21"] != 0 {
+		t.Fatalf("node filter = %+v", byNode.Totals)
+	}
+
+	byDevice, err := store.TrafficSeries(ctx, TrafficQuery{
+		From: at.Add(-time.Hour), To: at.Add(time.Hour),
+		Group: "device", Class: accounting.ClassTotal, DeviceID: "dev-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byDevice.Totals["dev-a"] != 40 || byDevice.Totals["dev-b"] != 0 {
+		t.Fatalf("device filter = %+v", byDevice.Totals)
+	}
+}

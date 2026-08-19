@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"io/fs"
 	"log"
@@ -32,6 +33,21 @@ func main() {
 	if err := server.EnsureFirstRunAdmin(store, os.Stdout); err != nil {
 		log.Fatal(err)
 	}
+
+	go func() {
+		run := func() {
+			now := time.Now().UTC()
+			if err := store.MaintainLedgers(context.Background(), now); err != nil {
+				log.Printf("ledger maintenance: %v", err)
+			}
+		}
+		run()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			run()
+		}
+	}()
 
 	staticFS, err := fs.Sub(webassets.Dist, "dist")
 	if err != nil {
