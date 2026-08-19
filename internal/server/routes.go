@@ -15,11 +15,13 @@ import (
 
 	"github.com/misakayyds/lantally/internal/enroll"
 	"github.com/misakayyds/lantally/internal/ingest"
+	"github.com/misakayyds/lantally/internal/store/metrics"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
 )
 
 type Config struct {
 	StaticFS fs.FS
+	Metrics  *metrics.Writer
 }
 
 type sessionStore struct {
@@ -53,6 +55,9 @@ func (s *sessionStore) valid(token string) bool {
 func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	sessions := newSessionStore()
 	ingestHandler := ingest.NewHandler(store)
+	if cfg.Metrics != nil {
+		ingestHandler.SetMetrics(cfg.Metrics)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/ingest", ingestHandler.Ingest)
 	mux.HandleFunc("GET /healthz", ingestHandler.Healthz)
@@ -60,9 +65,9 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/logout", logoutHandler(sessions))
 	mux.HandleFunc("POST /v1/enroll", requireSession(sessions, enrollHandler(store)))
 	mux.HandleFunc("GET /v1/overview", requireSession(sessions, overviewHandler(store)))
-	mux.HandleFunc("GET /v1/devices", requireSession(sessions, emptyListHandler("devices")))
+	mux.HandleFunc("GET /v1/devices", requireSession(sessions, devicesHandler(store)))
 	mux.HandleFunc("GET /v1/nodes", requireSession(sessions, nodesHandler(store)))
-	mux.HandleFunc("GET /v1/proxy", requireSession(sessions, emptyListHandler("proxy")))
+	mux.HandleFunc("GET /v1/proxy", requireSession(sessions, proxyHandler(store)))
 	mux.HandleFunc("GET /v1/alerts", requireSession(sessions, emptyListHandler("alerts")))
 	if cfg.StaticFS != nil {
 		mux.Handle("GET /{$}", http.FileServer(http.FS(cfg.StaticFS)))
@@ -179,9 +184,47 @@ func overviewHandler(store *sqlitestore.Store) http.HandlerFunc {
 			http.Error(w, "overview unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		bytes, err := store.LedgerTotals(r.Context())
+		if err != nil {
+			http.Error(w, "overview unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ledgers":        []string{"total", "direct", "proxy_raw", "proxy_adjusted"},
 			"ingest_batches": count,
+			"bytes":          bytes,
+		})
+	}
+}
+
+func devicesHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		devices, err := store.ListDeviceLedgers(r.Context())
+		if err != nil {
+			http.Error(w, "devices unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if devices == nil {
+			devices = []sqlitestore.DeviceLedger{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"devices": devices})
+	}
+}
+
+func proxyHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bytes, err := store.LedgerTotals(r.Context())
+		if err != nil {
+			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"proxy": map[string]uint64{
+				"direct":           bytes["direct"],
+				"proxy_raw":        bytes["proxy_raw"],
+				"proxy_adjusted":   bytes["proxy_adjusted"],
+				"proxy_unadjusted": bytes["proxy_unadjusted"],
+			},
 		})
 	}
 }

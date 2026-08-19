@@ -130,6 +130,32 @@ func TestIngestRetryStoresOneBatchAndStablePayloadHash(t *testing.T) {
 	if hash != hex.EncodeToString(sum[:]) {
 		t.Fatalf("payload hash = %q, want %q", hash, hex.EncodeToString(sum[:]))
 	}
+
+	totals, err := store.LedgerTotals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals["total"] != 1536 {
+		t.Fatalf("node total after first ingest = %d, want iface 1024+512=1536", totals["total"])
+	}
+	secondTotals, err := store.LedgerTotals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondTotals["total"] != totals["total"] {
+		t.Fatalf("duplicate ingest changed totals from %d to %d", totals["total"], secondTotals["total"])
+	}
+
+	devices, err := store.ListDeviceLedgers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 {
+		t.Fatalf("expected one resolved device, got %d", len(devices))
+	}
+	if devices[0].Bytes["total"] != 0 {
+		t.Fatalf("neigh observation should not count as total, got %d", devices[0].Bytes["total"])
+	}
 }
 
 func TestIngestRequiresGzipJSONContract(t *testing.T) {

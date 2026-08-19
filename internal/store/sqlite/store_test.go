@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/misakayyds/lantally/internal/accounting"
 	"github.com/misakayyds/lantally/internal/enroll"
 )
 
@@ -226,5 +227,30 @@ func TestAuthenticateOnlyChecksHashSelectedByCredentialID(t *testing.T) {
 
 	if _, err := store.Authenticate(ctx, forged); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected credential-id-selected hash rejection, got %v", err)
+	}
+}
+
+func TestApplyLedgerOnceIsIdempotent(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	increments := []accounting.Increment{{
+		Class: accounting.ClassTotal,
+		Rx:    100,
+		Tx:    50,
+	}}
+	first, err := store.ApplyLedgerOnce(ctx, "site-a", "node-a", "boot-a", 1, increments)
+	if err != nil || !first {
+		t.Fatalf("first apply = %v %v", first, err)
+	}
+	second, err := store.ApplyLedgerOnce(ctx, "site-a", "node-a", "boot-a", 1, increments)
+	if err != nil || second {
+		t.Fatalf("second apply = %v %v, want not applied", second, err)
+	}
+	totals, err := store.LedgerTotals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals[accounting.ClassTotal] != 150 {
+		t.Fatalf("total = %d, want 150", totals[accounting.ClassTotal])
 	}
 }

@@ -29,8 +29,14 @@ type Store struct {
 }
 
 type Node struct {
-	ID     string
-	SiteID string
+	ID     string `json:"id"`
+	SiteID string `json:"site_id"`
+}
+
+type DeviceLedger struct {
+	ID     string            `json:"id"`
+	SiteID string            `json:"site_id"`
+	Bytes  map[string]uint64 `json:"bytes"`
 }
 
 func Open(dsn string) (*Store, error) {
@@ -96,7 +102,15 @@ func applyMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(string(adminMigration))
+	if _, err := db.Exec(string(adminMigration)); err != nil {
+		return err
+	}
+
+	ledgerMigration, err := migrations.ReadFile("migrations/0005_ledgers.sql")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(string(ledgerMigration))
 	return err
 }
 

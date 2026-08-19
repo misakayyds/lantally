@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,16 +9,24 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/misakayyds/lantally/internal/accounting"
+	"github.com/misakayyds/lantally/internal/identity"
 	"github.com/misakayyds/lantally/internal/protocol"
+	"github.com/misakayyds/lantally/internal/store/metrics"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
 )
 
 type Handler struct {
-	store *sqlitestore.Store
+	store   *sqlitestore.Store
+	metrics *metrics.Writer
 }
 
 func NewHandler(store *sqlitestore.Store) *Handler {
 	return &Handler{store: store}
+}
+
+func (h *Handler) SetMetrics(writer *metrics.Writer) {
+	h.metrics = writer
 }
 
 func Routes(store *sqlitestore.Store) http.Handler {
@@ -84,6 +93,10 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+	if err := h.account(r.Context(), batch); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
@@ -102,6 +115,58 @@ func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, "ok\n")
+}
+
+func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
+	increments := accounting.NodeIncrements(batch, nil)
+	resolver := identity.NewResolver(h.store, batch.NodeID)
+	for _, obs := range batch.Devices {
+		deviceID, _, err := resolver.Resolve(batch.SiteID, obs, batch.SampledAt)
+		if err != nil {
+			if errors.Is(err, identity.ErrConflictingEvidence) {
+				continue
+			}
+			return err
+		}
+		increments = append(increments, accounting.DeviceIncrements(obs, deviceID, nil)...)
+	}
+	applied, err := h.store.ApplyLedgerOnce(
+		ctx,
+		batch.SiteID,
+		batch.NodeID,
+		batch.BootID,
+		batch.Sequence,
+		increments,
+	)
+	if err != nil {
+		return err
+	}
+	if applied && h.metrics != nil {
+		totals, totalsErr := h.store.NodeLedgerTotals(ctx, batch.SiteID, batch.NodeID)
+		if totalsErr == nil {
+			_ = h.metrics.Write(ctx, ledgerSamples(batch.SiteID, batch.NodeID, totals))
+		}
+	}
+	return nil
+}
+
+func ledgerSamples(siteID, nodeID string, totals map[string]uint64) []metrics.Sample {
+	samples := make([]metrics.Sample, 0, len(totals))
+	for class, value := range totals {
+		if value == 0 {
+			continue
+		}
+		samples = append(samples, metrics.Sample{
+			Name:  "lantally_bytes_total",
+			Value: float64(value),
+			Labels: map[string]string{
+				"site_id": siteID,
+				"node_id": nodeID,
+				"class":   class,
+			},
+		})
+	}
+	return samples
 }
 
 func bearerToken(header string) (string, bool) {

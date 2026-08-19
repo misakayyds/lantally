@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/misakayyds/lantally/internal/server"
+	"github.com/misakayyds/lantally/internal/store/metrics"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
 	webassets "github.com/misakayyds/lantally/web"
 )
@@ -37,9 +38,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	cfg := server.Config{StaticFS: staticFS}
+	if endpoint := os.Getenv("LANTALLY_METRICS_URL"); endpoint != "" {
+		cfg.Metrics = metrics.NewWriter(endpoint, nil)
+	}
+
 	httpServer := &http.Server{
 		Addr:              *listenAddr,
-		Handler:           server.Routes(store, server.Config{StaticFS: staticFS}),
+		Handler:           server.Routes(store, cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("lantally-server listening on %s", *listenAddr)

@@ -71,11 +71,26 @@ function setRoute(route) {
   pageEyebrow.textContent = ROUTES[route].eyebrow;
 }
 
+function formatBytes(value) {
+  const n = Number(value || 0);
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  let v = n;
+  do {
+    v /= 1024;
+    i += 1;
+  } while (v >= 1024 && i < units.length - 1);
+  const digits = v >= 10 ? 1 : 2;
+  return `${v.toFixed(digits)} ${units[i]}`;
+}
+
 function renderOverview(data) {
   const stats = document.getElementById("overview-stats");
   const tags = document.getElementById("ledger-tags");
   const count = data.ingest_batches ?? 0;
   const ledgers = data.ledgers ?? [];
+  const bytes = data.bytes ?? {};
 
   stats.innerHTML = `
     <article class="metric">
@@ -83,12 +98,16 @@ function renderOverview(data) {
       <div class="metric-value brand">${count.toLocaleString("zh-CN")}</div>
     </article>
     <article class="metric">
-      <div class="metric-label">账本维度</div>
-      <div class="metric-value">${ledgers.length}</div>
+      <div class="metric-label">总量</div>
+      <div class="metric-value">${formatBytes(bytes.total)}</div>
     </article>
     <article class="metric">
-      <div class="metric-label">服务</div>
-      <div class="metric-value ok">运行中</div>
+      <div class="metric-label">直连</div>
+      <div class="metric-value">${formatBytes(bytes.direct)}</div>
+    </article>
+    <article class="metric">
+      <div class="metric-label">代理（原始）</div>
+      <div class="metric-value">${formatBytes(bytes.proxy_raw)}</div>
     </article>
   `;
 
@@ -139,6 +158,68 @@ function renderEmptyCard(containerId, title, description) {
     </div>`;
 }
 
+function renderDevices(data) {
+  const devices = data.devices ?? [];
+  if (devices.length === 0) {
+    renderEmptyCard("devices-content", "暂无设备", "agent 上报带 IP/MAC 的观察后会出现在这里。");
+    return;
+  }
+  document.getElementById("devices-content").innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>设备</h3>
+          <p class="card-sub">neigh 观察只用于识别，不计入总量</p>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>设备</th><th>站点</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
+        <tbody>
+          ${devices
+            .map((device) => {
+              const bytes = device.bytes || {};
+              return `<tr>
+                <td>${escapeHtml(device.id || "")}</td>
+                <td>${escapeHtml(device.site_id || "")}</td>
+                <td>${formatBytes(bytes.total)}</td>
+                <td>${formatBytes(bytes.direct)}</td>
+                <td>${formatBytes(bytes.proxy_raw)}</td>
+              </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function renderProxy(data) {
+  const proxy = data.proxy || {};
+  const hasData = Object.values(proxy).some((value) => Number(value) > 0);
+  if (!hasData) {
+    renderEmptyCard("proxy-content", "暂无代理统计", "接入 Mihomo 后按 outbound 展示直连与代理。");
+    return;
+  }
+  document.getElementById("proxy-content").innerHTML = `
+    <div class="metrics">
+      <article class="metric">
+        <div class="metric-label">直连</div>
+        <div class="metric-value">${formatBytes(proxy.direct)}</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">代理（原始）</div>
+        <div class="metric-value">${formatBytes(proxy.proxy_raw)}</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">代理（倍率后）</div>
+        <div class="metric-value">${formatBytes(proxy.proxy_adjusted)}</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">未调倍率</div>
+        <div class="metric-value">${formatBytes(proxy.proxy_unadjusted)}</div>
+      </article>
+    </div>`;
+}
+
 async function loadView(route) {
   const response = await api(`/v1/${route}`);
   if (response.status === 401) {
@@ -159,10 +240,10 @@ async function loadView(route) {
       renderNodes(data);
       break;
     case "devices":
-      renderEmptyCard("devices-content", "暂无设备", "agent 上报后会按 IP/MAC 汇总流量。");
+      renderDevices(data);
       break;
     case "proxy":
-      renderEmptyCard("proxy-content", "暂无代理统计", "接入 Mihomo 后按 outbound 展示。");
+      renderProxy(data);
       break;
     case "alerts":
       renderEmptyCard("alerts-content", "暂无告警", "节点离线或偏差过大时会在这里提示。");
