@@ -158,8 +158,12 @@ func TestOverviewShowsLedgerBytesAfterIngest(t *testing.T) {
 	if overviewRec.Code != http.StatusOK {
 		t.Fatalf("overview = %d %s", overviewRec.Code, overviewRec.Body.String())
 	}
-	if !strings.Contains(overviewRec.Body.String(), `"total":1536`) {
-		t.Fatalf("overview missing iface total: %s", overviewRec.Body.String())
+	body := overviewRec.Body.String()
+	if !strings.Contains(body, `"total":1536`) {
+		t.Fatalf("overview missing iface total: %s", body)
+	}
+	if !strings.Contains(body, `"bucket_seconds":1800`) || !strings.Contains(body, `"sim-node"`) {
+		t.Fatalf("overview missing 72h traffic series: %s", body)
 	}
 
 	devicesReq := httptest.NewRequest(http.MethodGet, "/v1/devices", nil)

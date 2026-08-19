@@ -136,6 +136,7 @@ func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
 		batch.NodeID,
 		batch.BootID,
 		batch.Sequence,
+		batch.SampledAt,
 		increments,
 	)
 	if err != nil {

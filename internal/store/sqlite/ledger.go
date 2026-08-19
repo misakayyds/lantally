@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"math"
+	"sort"
+	"time"
 
 	"github.com/misakayyds/lantally/internal/accounting"
 )
@@ -12,6 +14,7 @@ func (s *Store) ApplyLedgerOnce(
 	ctx context.Context,
 	siteID, nodeID, bootID string,
 	seq uint64,
+	sampledAt time.Time,
 	increments []accounting.Increment,
 ) (applied bool, err error) {
 	if seq > math.MaxInt64 {
@@ -49,6 +52,11 @@ func (s *Store) ApplyLedgerOnce(
 		return false, nil
 	}
 
+	if sampledAt.IsZero() {
+		sampledAt = time.Now().UTC()
+	}
+	sampledUnix := sampledAt.UTC().Unix()
+
 	for _, item := range increments {
 		if item.Rx == 0 && item.Tx == 0 {
 			continue
@@ -59,6 +67,21 @@ func (s *Store) ApplyLedgerOnce(
 			 VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(site_id, node_id, device_id, class)
 			 DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx`,
+			siteID,
+			nodeID,
+			item.DeviceID,
+			item.Class,
+			int64(item.Rx),
+			int64(item.Tx),
+		)
+		if err != nil {
+			return false, err
+		}
+		_, err = tx.ExecContext(
+			ctx,
+			`INSERT INTO ledger_samples (sampled_at, site_id, node_id, device_id, class, rx, tx)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			sampledUnix,
 			siteID,
 			nodeID,
 			item.DeviceID,
@@ -167,4 +190,124 @@ func scanClassTotals(rows *sql.Rows) (map[string]uint64, error) {
 		totals[class] = uint64(bytes)
 	}
 	return totals, rows.Err()
+}
+
+type TrafficQuery struct {
+	From          time.Time
+	To            time.Time
+	BucketSeconds int
+	Class         string
+	Group         string
+}
+
+type TrafficPoint struct {
+	Bucket time.Time         `json:"t"`
+	Values map[string]uint64 `json:"values"`
+}
+
+type TrafficSeries struct {
+	BucketSeconds int               `json:"bucket_seconds"`
+	Keys          []string          `json:"keys"`
+	Totals        map[string]uint64 `json:"totals"`
+	Points        []TrafficPoint    `json:"points"`
+}
+
+func (s *Store) TrafficSeries(ctx context.Context, query TrafficQuery) (TrafficSeries, error) {
+	if query.BucketSeconds <= 0 {
+		query.BucketSeconds = 1800
+	}
+	if query.Group == "" {
+		query.Group = "node"
+	}
+	if query.Class == "" {
+		query.Class = accounting.ClassTotal
+	}
+	if query.To.IsZero() {
+		query.To = time.Now().UTC()
+	}
+	if query.From.IsZero() {
+		query.From = query.To.Add(-72 * time.Hour)
+	}
+
+	keyExpr := "node_id"
+	whereClass := `class = ?`
+	fromUnix := query.From.UTC().Unix()
+	toUnix := query.To.UTC().Unix()
+	args := []any{query.BucketSeconds, query.BucketSeconds, query.Class, fromUnix, toUnix}
+	if query.Group == "class" {
+		keyExpr = "class"
+		whereClass = `class IN ('direct', 'proxy_raw', 'proxy_adjusted', 'proxy_unadjusted')`
+		args = []any{query.BucketSeconds, query.BucketSeconds, fromUnix, toUnix}
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT (sampled_at / ?) * ? AS bucket, `+keyExpr+`, SUM(rx + tx)
+		 FROM ledger_samples
+		 WHERE device_id = '' AND `+whereClass+`
+		   AND sampled_at >= ? AND sampled_at < ?
+		 GROUP BY bucket, `+keyExpr+`
+		 ORDER BY bucket, `+keyExpr,
+		args...,
+	)
+	if err != nil {
+		return TrafficSeries{}, err
+	}
+	defer rows.Close()
+
+	pointsByBucket := map[int64]map[string]uint64{}
+	totals := map[string]uint64{}
+	keySet := map[string]struct{}{}
+
+	for rows.Next() {
+		var bucket int64
+		var key string
+		var bytes int64
+		if err := rows.Scan(&bucket, &key, &bytes); err != nil {
+			return TrafficSeries{}, err
+		}
+		if bytes < 0 {
+			bytes = 0
+		}
+		if pointsByBucket[bucket] == nil {
+			pointsByBucket[bucket] = map[string]uint64{}
+		}
+		pointsByBucket[bucket][key] += uint64(bytes)
+		totals[key] += uint64(bytes)
+		keySet[key] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return TrafficSeries{}, err
+	}
+
+	fromSec := query.From.UTC().Unix() / int64(query.BucketSeconds) * int64(query.BucketSeconds)
+	toSec := query.To.UTC().Unix()
+	keys := sortedKeys(keySet)
+	points := make([]TrafficPoint, 0, int((toSec-fromSec)/int64(query.BucketSeconds))+1)
+	for bucket := fromSec; bucket < toSec; bucket += int64(query.BucketSeconds) {
+		values := map[string]uint64{}
+		for _, key := range keys {
+			values[key] = pointsByBucket[bucket][key]
+		}
+		points = append(points, TrafficPoint{
+			Bucket: time.Unix(bucket, 0).UTC(),
+			Values: values,
+		})
+	}
+
+	return TrafficSeries{
+		BucketSeconds: query.BucketSeconds,
+		Keys:          keys,
+		Totals:        totals,
+		Points:        points,
+	}, nil
+}
+
+func sortedKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

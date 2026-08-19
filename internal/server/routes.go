@@ -189,10 +189,16 @@ func overviewHandler(store *sqlitestore.Store) http.HandlerFunc {
 			http.Error(w, "overview unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		traffic, err := lastTraffic(store, r, "node", "total")
+		if err != nil {
+			http.Error(w, "overview unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ledgers":        []string{"total", "direct", "proxy_raw", "proxy_adjusted"},
 			"ingest_batches": count,
 			"bytes":          bytes,
+			"traffic":        traffic,
 		})
 	}
 }
@@ -218,6 +224,11 @@ func proxyHandler(store *sqlitestore.Store) http.HandlerFunc {
 			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		traffic, err := lastTraffic(store, r, "class", "")
+		if err != nil {
+			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"proxy": map[string]uint64{
 				"direct":           bytes["direct"],
@@ -225,6 +236,7 @@ func proxyHandler(store *sqlitestore.Store) http.HandlerFunc {
 				"proxy_adjusted":   bytes["proxy_adjusted"],
 				"proxy_unadjusted": bytes["proxy_unadjusted"],
 			},
+			"traffic": traffic,
 		})
 	}
 }
@@ -239,7 +251,25 @@ func nodesHandler(store *sqlitestore.Store) http.HandlerFunc {
 		if nodes == nil {
 			nodes = []sqlitestore.Node{}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": nodes})
+		out := make([]map[string]any, 0, len(nodes))
+		for _, node := range nodes {
+			bytes, err := store.NodeLedgerTotals(r.Context(), node.SiteID, node.ID)
+			if err != nil {
+				http.Error(w, "nodes unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			out = append(out, map[string]any{
+				"id":      node.ID,
+				"site_id": node.SiteID,
+				"bytes":   bytes,
+			})
+		}
+		traffic, err := lastTraffic(store, r, "node", "total")
+		if err != nil {
+			http.Error(w, "nodes unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": out, "traffic": traffic})
 	}
 }
 
@@ -247,6 +277,17 @@ func emptyListHandler(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{name: []any{}})
 	}
+}
+
+func lastTraffic(store *sqlitestore.Store, r *http.Request, group, class string) (sqlitestore.TrafficSeries, error) {
+	now := time.Now().UTC()
+	return store.TrafficSeries(r.Context(), sqlitestore.TrafficQuery{
+		From:          now.Add(-72 * time.Hour),
+		To:            now,
+		BucketSeconds: 1800,
+		Group:         group,
+		Class:         class,
+	})
 }
 
 // EnsureFirstRunAdmin creates a one-time admin password when none exists.

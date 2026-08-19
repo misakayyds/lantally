@@ -85,11 +85,264 @@ function formatBytes(value) {
   return `${v.toFixed(digits)} ${units[i]}`;
 }
 
+const CHART_PALETTE = [
+  "#6db56d",
+  "#e2c14c",
+  "#5b9bd5",
+  "#9b7eb8",
+  "#e07a5f",
+  "#4db6ac",
+  "#f0a05a",
+  "#7a9e7e",
+  "#6c7ae0",
+  "#c97b84",
+  "#88b04b",
+  "#4a90c8",
+];
+
+const CLASS_LABELS = {
+  direct: "直连",
+  proxy_raw: "代理原始",
+  proxy_adjusted: "代理倍率后",
+  proxy_unadjusted: "未调倍率",
+  total: "总量",
+};
+
+function colorFor(key) {
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  }
+  return CHART_PALETTE[hash % CHART_PALETTE.length];
+}
+
+function seriesLabel(key) {
+  return CLASS_LABELS[key] || key;
+}
+
+function formatChartBytes(value) {
+  const n = Number(value || 0);
+  if (n < 1024) return `${n} B`;
+  const units = ["kB", "MB", "GB", "TB"];
+  let i = -1;
+  let v = n;
+  do {
+    v /= 1024;
+    i += 1;
+  } while (v >= 1024 && i < units.length - 1);
+  const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
+  return `${v.toFixed(digits)} ${units[i]}`;
+}
+
+function niceMax(value) {
+  if (value <= 0) return 1;
+  const exp = 10 ** Math.floor(Math.log10(value));
+  const n = value / exp;
+  const nice = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return nice * exp;
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function formatStamp(date) {
+  return `${date.getFullYear()}/${date.getMonth() + 1}/${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+}
+
+function stackedMax(points, keys) {
+  let max = 0;
+  for (const point of points) {
+    let sum = 0;
+    for (const key of keys) sum += Number((point.values || {})[key] || 0);
+    if (sum > max) max = sum;
+  }
+  return max;
+}
+
+function axisUnit(maxBytes) {
+  if (maxBytes >= 1024 * 1024 * 1024) return { div: 1024 * 1024 * 1024, label: "流量/GB" };
+  if (maxBytes >= 1024 * 1024) return { div: 1024 * 1024, label: "流量/MB" };
+  if (maxBytes >= 1024) return { div: 1024, label: "流量/kB" };
+  return { div: 1, label: "流量/B" };
+}
+
+function renderTrafficChart(el, series, emptyHint) {
+  if (!el) return;
+  const points = series?.points || [];
+  const keys = [...(series?.keys || [])].sort((a, b) => {
+    return Number((series.totals || {})[b] || 0) - Number((series.totals || {})[a] || 0);
+  });
+  const totals = series?.totals || {};
+  const bucketSec = Number(series?.bucket_seconds || 1800);
+  const hasData = keys.some((key) => Number(totals[key] || 0) > 0);
+  const pageSize = 4;
+  let legendPage = 0;
+
+  const width = 1080;
+  const height = 320;
+  const pad = { top: 18, right: 10, bottom: 36, left: 58 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const maxBytes = stackedMax(points, keys);
+  const unit = axisUnit(maxBytes);
+  const yMax = niceMax(maxBytes / unit.div);
+  const ticks = 5;
+  const n = Math.max(points.length, 1);
+  const slot = plotW / n;
+  const barW = Math.max(1.2, slot * 0.72);
+
+  function draw() {
+    const pageCount = Math.max(1, Math.ceil(keys.length / pageSize));
+    legendPage = Math.max(0, Math.min(legendPage, pageCount - 1));
+    const visibleKeys = keys.slice(legendPage * pageSize, legendPage * pageSize + pageSize);
+
+    const grid = [];
+    for (let i = 0; i <= ticks; i += 1) {
+      const value = (yMax / ticks) * (ticks - i);
+      const y = pad.top + (plotH / ticks) * i;
+      grid.push(`
+        <line x1="${pad.left}" x2="${width - pad.right}" y1="${y}" y2="${y}" stroke="#eef1f4" />
+        <text x="${pad.left - 8}" y="${y + 4}" text-anchor="end" fill="#9aa3af" font-size="11">${
+          value >= 100 ? value.toFixed(0) : value.toFixed(2)
+        }</text>`);
+    }
+
+    const xLabels = [];
+    let lastDay = "";
+    points.forEach((point, i) => {
+      const t = new Date(point.t);
+      const day = `${t.getFullYear()}-${t.getMonth()}-${t.getDate()}`;
+      const hour = t.getHours();
+      const minute = t.getMinutes();
+      const x = pad.left + slot * i + slot / 2;
+      if (day !== lastDay) {
+        lastDay = day;
+        xLabels.push(
+          `<text x="${x}" y="${height - 8}" text-anchor="middle" fill="#6b7280" font-size="11">${t.getDate()}</text>`
+        );
+      } else if (hour === 12 && minute === 0) {
+        xLabels.push(
+          `<text x="${x}" y="${height - 8}" text-anchor="middle" fill="#9aa3af" font-size="11">12:00</text>`
+        );
+      }
+    });
+
+    const bars = points
+      .map((point, i) => {
+        let yBase = pad.top + plotH;
+        const x = pad.left + slot * i + (slot - barW) / 2;
+        const segs = keys
+          .map((key) => {
+            const bytes = Number((point.values || {})[key] || 0);
+            if (bytes <= 0) return "";
+            const h = (bytes / unit.div / yMax) * plotH;
+            const y = yBase - h;
+            const rect = `<rect x="${x}" y="${y}" width="${barW}" height="${Math.max(h, 0)}" fill="${colorFor(key)}" />`;
+            yBase = y;
+            return rect;
+          })
+          .join("");
+        return `${segs}<rect class="chart-hit" data-bucket="${i}" x="${pad.left + slot * i}" y="${pad.top}" width="${slot}" height="${plotH}" fill="transparent" />`;
+      })
+      .join("");
+
+    const legendItems = visibleKeys
+      .map((key) => {
+        return `<div class="chart-legend-item">
+          <span class="chart-swatch" style="background:${colorFor(key)}"></span>
+          <span>${escapeHtml(seriesLabel(key))} (${formatChartBytes(totals[key] || 0)})</span>
+        </div>`;
+      })
+      .join("");
+
+    const nav =
+      keys.length > pageSize
+        ? `<div class="chart-legend-nav">
+            <button type="button" data-legend="-1" ${legendPage === 0 ? "disabled" : ""} aria-label="上一页">‹</button>
+            <span>${legendPage + 1}/${pageCount}</span>
+            <button type="button" data-legend="1" ${legendPage >= pageCount - 1 ? "disabled" : ""} aria-label="下一页">›</button>
+          </div>`
+        : "";
+
+    el.innerHTML = `
+      <div class="chart-panel">
+        <div class="chart-head">
+          <span class="chart-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <h3 class="chart-title">最近72小时流量使用情况</h3>
+        </div>
+        <div class="chart-plot">
+          <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="最近72小时流量使用情况">
+            <text x="14" y="${pad.top + plotH / 2}" fill="#9aa3af" font-size="11" text-anchor="middle" transform="rotate(-90 14 ${pad.top + plotH / 2})">${unit.label}</text>
+            ${grid.join("")}
+            ${bars}
+            ${xLabels.join("")}
+          </svg>
+          ${hasData ? "" : `<div class="chart-empty">${escapeHtml(emptyHint)}</div>`}
+          <div class="chart-tooltip hidden"></div>
+        </div>
+        <div class="chart-legend">
+          <div class="chart-legend-items">${legendItems || `<span class="chart-legend-item">暂无分段</span>`}</div>
+          ${nav}
+        </div>
+      </div>`;
+
+    const plot = el.querySelector(".chart-plot");
+    const tooltip = el.querySelector(".chart-tooltip");
+
+    el.querySelectorAll("[data-legend]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        legendPage += Number(btn.dataset.legend);
+        draw();
+      });
+    });
+
+    plot.querySelectorAll(".chart-hit").forEach((hit) => {
+      hit.addEventListener("pointerenter", (event) => showTip(event, Number(hit.dataset.bucket)));
+      hit.addEventListener("pointermove", (event) => showTip(event, Number(hit.dataset.bucket)));
+      hit.addEventListener("pointerleave", () => tooltip.classList.add("hidden"));
+    });
+
+    function showTip(event, index) {
+      const point = points[index];
+      if (!point) return;
+      const from = new Date(point.t);
+      const to = new Date(from.getTime() + bucketSec * 1000);
+      const rows = keys
+        .map((key) => {
+          const bytes = Number((point.values || {})[key] || 0);
+          if (bytes <= 0) return "";
+          return `<div class="chart-tip-row">
+            <span class="chart-tip-dot" style="background:${colorFor(key)}"></span>
+            <span class="chart-tip-name">${escapeHtml(seriesLabel(key))}</span>
+            <span class="chart-tip-val">${formatChartBytes(bytes)}</span>
+          </div>`;
+        })
+        .join("");
+      let sum = 0;
+      for (const key of keys) sum += Number((point.values || {})[key] || 0);
+      tooltip.innerHTML = `
+        ${rows || `<div class="chart-tip-row"><span class="chart-tip-name">无流量</span></div>`}
+        <div class="chart-tip-meta">
+          <span>From</span><strong>${formatStamp(from)}</strong>
+          <span>To</span><strong>${formatStamp(to)}</strong>
+          <span>Sum</span><strong>${formatChartBytes(sum)}</strong>
+        </div>`;
+      tooltip.classList.remove("hidden");
+      const bounds = plot.getBoundingClientRect();
+      const left = Math.min(event.clientX - bounds.left + 12, bounds.width - 236);
+      const top = Math.max(8, event.clientY - bounds.top - 12);
+      tooltip.style.left = `${Math.max(8, left)}px`;
+      tooltip.style.top = `${top}px`;
+    }
+  }
+
+  draw();
+}
+
 function renderOverview(data) {
   const stats = document.getElementById("overview-stats");
-  const tags = document.getElementById("ledger-tags");
   const count = data.ingest_batches ?? 0;
-  const ledgers = data.ledgers ?? [];
   const bytes = data.bytes ?? {};
 
   stats.innerHTML = `
@@ -111,12 +364,20 @@ function renderOverview(data) {
     </article>
   `;
 
-  tags.innerHTML = ledgers.length
-    ? ledgers.map((name) => `<span class="chip">${escapeHtml(name)}</span>`).join("")
-    : `<span class="chip">暂无</span>`;
+  renderTrafficChart(
+    document.getElementById("overview-chart"),
+    data.traffic,
+    "新上报后才会出现柱状图。累计总量仍显示在上方。"
+  );
 }
 
 function renderNodes(data) {
+  renderTrafficChart(
+    document.getElementById("nodes-chart"),
+    data.traffic,
+    "节点上报后，按节点堆叠显示最近 72 小时流量。"
+  );
+
   const wrap = document.getElementById("nodes-table-wrap");
   const nodes = data.nodes ?? [];
 
@@ -132,16 +393,20 @@ function renderNodes(data) {
 
   wrap.innerHTML = `
     <table>
-      <thead><tr><th>节点</th><th>站点</th></tr></thead>
+      <thead><tr><th>节点</th><th>站点</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
       <tbody>
         ${nodes
-          .map(
-            (node) => `
+          .map((node) => {
+            const bytes = node.bytes || {};
+            return `
           <tr>
-            <td>${escapeHtml(node.ID || node.id || "")}</td>
-            <td>${escapeHtml(node.SiteID || node.site_id || "")}</td>
-          </tr>`
-          )
+            <td>${escapeHtml(node.id || node.ID || "")}</td>
+            <td>${escapeHtml(node.site_id || node.SiteID || "")}</td>
+            <td>${formatBytes(bytes.total)}</td>
+            <td>${formatBytes(bytes.direct)}</td>
+            <td>${formatBytes(bytes.proxy_raw)}</td>
+          </tr>`;
+          })
           .join("")}
       </tbody>
     </table>`;
@@ -194,12 +459,8 @@ function renderDevices(data) {
 
 function renderProxy(data) {
   const proxy = data.proxy || {};
-  const hasData = Object.values(proxy).some((value) => Number(value) > 0);
-  if (!hasData) {
-    renderEmptyCard("proxy-content", "暂无代理统计", "接入 Mihomo 后按 outbound 展示直连与代理。");
-    return;
-  }
   document.getElementById("proxy-content").innerHTML = `
+    <div id="proxy-chart"></div>
     <div class="metrics">
       <article class="metric">
         <div class="metric-label">直连</div>
@@ -218,6 +479,11 @@ function renderProxy(data) {
         <div class="metric-value">${formatBytes(proxy.proxy_unadjusted)}</div>
       </article>
     </div>`;
+  renderTrafficChart(
+    document.getElementById("proxy-chart"),
+    data.traffic,
+    "接入 Mihomo 后，这里按直连和代理堆叠显示。"
+  );
 }
 
 async function loadView(route) {

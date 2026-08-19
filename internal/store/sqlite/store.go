@@ -110,7 +110,15 @@ func applyMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(string(ledgerMigration))
+	if _, err := db.Exec(string(ledgerMigration)); err != nil {
+		return err
+	}
+
+	sampleMigration, err := migrations.ReadFile("migrations/0006_ledger_samples.sql")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(string(sampleMigration))
 	return err
 }
 

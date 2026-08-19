@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/misakayyds/lantally/internal/accounting"
 	"github.com/misakayyds/lantally/internal/enroll"
@@ -238,11 +239,11 @@ func TestApplyLedgerOnceIsIdempotent(t *testing.T) {
 		Rx:    100,
 		Tx:    50,
 	}}
-	first, err := store.ApplyLedgerOnce(ctx, "site-a", "node-a", "boot-a", 1, increments)
+	first, err := store.ApplyLedgerOnce(ctx, "site-a", "node-a", "boot-a", 1, time.Now().UTC(), increments)
 	if err != nil || !first {
 		t.Fatalf("first apply = %v %v", first, err)
 	}
-	second, err := store.ApplyLedgerOnce(ctx, "site-a", "node-a", "boot-a", 1, increments)
+	second, err := store.ApplyLedgerOnce(ctx, "site-a", "node-a", "boot-a", 1, time.Now().UTC(), increments)
 	if err != nil || second {
 		t.Fatalf("second apply = %v %v, want not applied", second, err)
 	}
@@ -252,5 +253,55 @@ func TestApplyLedgerOnceIsIdempotent(t *testing.T) {
 	}
 	if totals[accounting.ClassTotal] != 150 {
 		t.Fatalf("total = %d, want 150", totals[accounting.ClassTotal])
+	}
+}
+
+func TestTrafficSeriesBucketsNodeTotals(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	t1 := time.Date(2026, 8, 19, 4, 5, 0, 0, time.UTC)
+	t2 := time.Date(2026, 8, 19, 4, 40, 0, 0, time.UTC)
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 1, t1, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 1000, Tx: 500},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 2, t2, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 200, Tx: 100},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "dns-21", "boot-b", 1, t1, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 50, Tx: 25},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	series, err := store.TrafficSeries(ctx, TrafficQuery{
+		From:          t1.Add(-time.Hour),
+		To:            t2.Add(time.Hour),
+		BucketSeconds: 1800,
+		Class:         accounting.ClassTotal,
+		Group:         "node",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Keys) != 2 {
+		t.Fatalf("keys = %+v, want two nodes", series.Keys)
+	}
+	if series.Totals["proxy-20"] != 1800 || series.Totals["dns-21"] != 75 {
+		t.Fatalf("totals = %+v", series.Totals)
+	}
+	got := map[int64]uint64{}
+	for _, point := range series.Points {
+		if point.Values["proxy-20"] > 0 {
+			got[point.Bucket.Unix()] = point.Values["proxy-20"]
+		}
+	}
+	firstBucket := time.Date(2026, 8, 19, 4, 0, 0, 0, time.UTC).Unix()
+	secondBucket := time.Date(2026, 8, 19, 4, 30, 0, 0, time.UTC).Unix()
+	if got[firstBucket] != 1500 || got[secondBucket] != 300 {
+		t.Fatalf("proxy-20 buckets = %+v", got)
 	}
 }
