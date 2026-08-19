@@ -2,6 +2,8 @@
 
 v0.1 execution details are in [`docs/superpowers/plans/2026-08-18-v0.1-implementation.md`](superpowers/plans/2026-08-18-v0.1-implementation.md).
 
+The path from the current `main` to the first installable release (v0.1.0) is planned in [`docs/superpowers/plans/2026-08-19-road-to-first-release.md`](superpowers/plans/2026-08-19-road-to-first-release.md) (R1-R7: outbound/device ledgers, time and device filters, per-outbound proxy view, multipliers, alerts, zero-CLI deployment, release engineering).
+
 ## v0.1: trustworthy read-only accounting
 
 1. Repository foundation, protocol schema, and simulated agents.
