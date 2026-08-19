@@ -18,7 +18,9 @@ import (
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
 )
 
-const testToken = "synthetic-node-token"
+func syntheticToken(credentialID string, fill byte) string {
+	return "lt_" + credentialID + "_" + strings.Repeat(string(fill), 32)
+}
 
 func testServer(t *testing.T) (*sqlitestore.Store, http.Handler) {
 	t.Helper()
@@ -27,11 +29,13 @@ func testServer(t *testing.T) (*sqlitestore.Store, http.Handler) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	token := syntheticToken("sim-cred", 'a')
 	if err := store.CreateNode(
 		context.Background(),
 		"sim-node",
 		"sim-site",
-		enroll.HashToken(testToken),
+		"sim-cred",
+		enroll.HashToken(token),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +46,8 @@ func postBatch(t *testing.T, handler http.Handler, token string, raw []byte) *ht
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/ingest", bytes.NewReader(raw))
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec
@@ -53,6 +59,7 @@ func TestIngestRetryStoresOneBatchAndStablePayloadHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	testToken := syntheticToken("sim-cred", 'a')
 
 	first := postBatch(t, handler, testToken, raw)
 	if first.Code != http.StatusOK || first.Body.String() != "{\"status\":\"ok\",\"duplicate\":false}\n" {
@@ -80,25 +87,69 @@ func TestIngestRetryStoresOneBatchAndStablePayloadHash(t *testing.T) {
 	}
 }
 
-func TestIngestAcceptsRawJSON(t *testing.T) {
+func TestIngestRequiresGzipJSONContract(t *testing.T) {
 	_, handler := testServer(t)
-	raw, err := json.Marshal(sim.Snapshot(1, "boot-raw"))
+	gzipped, err := protocol.Encode(sim.Snapshot(1, "boot-contract"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := postBatch(t, handler, testToken, raw)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	raw, err := json.Marshal(sim.Snapshot(1, "boot-contract"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := syntheticToken("sim-cred", 'a')
+
+	tests := []struct {
+		name            string
+		body            []byte
+		contentEncoding string
+		contentType     string
+	}{
+		{
+			name:        "missing content encoding",
+			body:        gzipped,
+			contentType: "application/json",
+		},
+		{
+			name:            "wrong content type",
+			body:            gzipped,
+			contentEncoding: "gzip",
+			contentType:     "text/plain",
+		},
+		{
+			name:            "raw JSON labeled gzip",
+			body:            raw,
+			contentEncoding: "gzip",
+			contentType:     "application/json",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/ingest", bytes.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			if tt.contentEncoding != "" {
+				req.Header.Set("Content-Encoding", tt.contentEncoding)
+			}
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 
 func TestIngestRejectsBadAndRevokedTokens(t *testing.T) {
 	store, handler := testServer(t)
+	testToken := syntheticToken("sim-cred", 'a')
 	raw, err := protocol.Encode(sim.Snapshot(1, "boot-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec := postBatch(t, handler, "wrong-token", raw); rec.Code != http.StatusUnauthorized {
+	if rec := postBatch(t, handler, syntheticToken("missing", 'z'), raw); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("bad token status=%d body=%q", rec.Code, rec.Body.String())
 	}
 	if err := store.RevokeNode(context.Background(), "sim-node"); err != nil {
@@ -111,6 +162,7 @@ func TestIngestRejectsBadAndRevokedTokens(t *testing.T) {
 
 func TestIngestRejectsProtocolV2(t *testing.T) {
 	_, handler := testServer(t)
+	testToken := syntheticToken("sim-cred", 'a')
 	batch := sim.Snapshot(1, "boot-a")
 	batch.ProtocolVersion = 2
 	raw, err := protocol.Encode(batch)
@@ -124,6 +176,7 @@ func TestIngestRejectsProtocolV2(t *testing.T) {
 
 func TestIngestRejectsSequenceRegression(t *testing.T) {
 	_, handler := testServer(t)
+	testToken := syntheticToken("sim-cred", 'a')
 	for _, seq := range []uint64{2, 1} {
 		raw, err := protocol.Encode(sim.Snapshot(seq, "boot-a"))
 		if err != nil {
@@ -142,6 +195,7 @@ func TestIngestRejectsSequenceRegression(t *testing.T) {
 
 func TestIngestReturnsEmpty503WhenSQLiteUnavailable(t *testing.T) {
 	store, handler := testServer(t)
+	testToken := syntheticToken("sim-cred", 'a')
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +214,7 @@ func TestIngestReturnsEmpty503WhenSQLiteUnavailable(t *testing.T) {
 
 func TestIngestRejectsCredentialIdentityMismatch(t *testing.T) {
 	_, handler := testServer(t)
+	testToken := syntheticToken("sim-cred", 'a')
 	batch := sim.Snapshot(1, "boot-a")
 	batch.NodeID = "other-node"
 	raw, err := protocol.Encode(batch)

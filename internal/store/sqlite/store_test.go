@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/misakayyds/lantally/internal/enroll"
@@ -21,12 +22,29 @@ func openTestStore(t *testing.T) *Store {
 	return store
 }
 
+func tokenFor(credentialID string, fill byte) string {
+	return "lt_" + credentialID + "_" + strings.Repeat(string(fill), 32)
+}
+
+func createTestNode(t *testing.T, store *Store, nodeID, credentialID string, fill byte) string {
+	t.Helper()
+	token := tokenFor(credentialID, fill)
+	if err := store.CreateNode(
+		context.Background(),
+		nodeID,
+		"site-a",
+		credentialID,
+		enroll.HashToken(token),
+	); err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
 func TestInsertBatchDeduplicatesAndPreservesHash(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	if err := store.CreateNode(ctx, "node-a", "site-a", enroll.HashToken("token-a")); err != nil {
-		t.Fatal(err)
-	}
+	createTestNode(t, store, "node-a", "cred-a", 'a')
 
 	raw := []byte(`{"synthetic":"payload"}`)
 	inserted, err := store.InsertBatch(ctx, "node-a", "boot-a", 1, raw)
@@ -58,9 +76,7 @@ func TestInsertBatchDeduplicatesAndPreservesHash(t *testing.T) {
 func TestInsertBatchRejectsSequenceRegressionWithinBoot(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	if err := store.CreateNode(ctx, "node-a", "site-a", enroll.HashToken("token-a")); err != nil {
-		t.Fatal(err)
-	}
+	createTestNode(t, store, "node-a", "cred-a", 'a')
 	if _, err := store.InsertBatch(ctx, "node-a", "boot-a", 2, []byte("two")); err != nil {
 		t.Fatal(err)
 	}
@@ -72,9 +88,7 @@ func TestInsertBatchRejectsSequenceRegressionWithinBoot(t *testing.T) {
 func TestInsertBatchAllowsNewBootAtSequenceOne(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	if err := store.CreateNode(ctx, "node-a", "site-a", enroll.HashToken("token-a")); err != nil {
-		t.Fatal(err)
-	}
+	createTestNode(t, store, "node-a", "cred-a", 'a')
 	if _, err := store.InsertBatch(ctx, "node-a", "boot-a", 8, []byte("old boot")); err != nil {
 		t.Fatal(err)
 	}
@@ -87,17 +101,36 @@ func TestInsertBatchAllowsNewBootAtSequenceOne(t *testing.T) {
 func TestAuthenticateRejectsRevokedToken(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	if err := store.CreateNode(ctx, "node-a", "site-a", enroll.HashToken("token-a")); err != nil {
-		t.Fatal(err)
-	}
-	node, err := store.Authenticate(ctx, "token-a")
+	token := createTestNode(t, store, "node-a", "cred-a", 'a')
+	node, err := store.Authenticate(ctx, token)
 	if err != nil || node.ID != "node-a" || node.SiteID != "site-a" {
 		t.Fatalf("authenticate: node=%+v err=%v", node, err)
 	}
 	if err := store.RevokeNode(ctx, "node-a"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Authenticate(ctx, "token-a"); !errors.Is(err, ErrUnauthorized) {
+	if _, err := store.Authenticate(ctx, token); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	}
+}
+
+func TestAuthenticateOnlyChecksHashSelectedByCredentialID(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	createTestNode(t, store, "node-a", "cred-a", 'a')
+
+	forged := tokenFor("cred-a", 'b')
+	if err := store.CreateNode(
+		ctx,
+		"node-b",
+		"site-a",
+		"cred-b",
+		enroll.HashToken(forged),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Authenticate(ctx, forged); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected credential-id-selected hash rejection, got %v", err)
 	}
 }

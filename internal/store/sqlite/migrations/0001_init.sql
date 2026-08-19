@@ -3,6 +3,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS nodes (
   id TEXT PRIMARY KEY,
   site_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL UNIQUE,
   token_hash BLOB NOT NULL,
   revoked INTEGER NOT NULL DEFAULT 0
 );
