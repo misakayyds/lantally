@@ -925,6 +925,38 @@ tbody tr:last-child td {
   width: auto;
 }
 
+.check-field {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin: 0.85rem 0 0.5rem;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+}
+
+.check-field input {
+  margin-top: 0.2rem;
+}
+
+.install-platforms {
+  margin: 0.65rem 0 0.55rem;
+}
+
+.wait-status {
+  margin: 0.75rem 0 0;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+}
+
+.wait-status.ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.status-muted {
+  color: var(--text-tertiary);
+}
+
 /* —— Toast —— */
 .toast {
   position: fixed;

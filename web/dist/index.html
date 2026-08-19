@@ -35,7 +35,7 @@
             <span class="logo-mark">LT</span>
             <div>
               <strong>LanTally</strong>
-              <span>登录控制台</span>
+              <span id="login-mode-label">登录控制台</span>
             </div>
           </div>
           <label for="login-password">管理员密码</label>
@@ -44,11 +44,23 @@
             name="password"
             type="password"
             autocomplete="current-password"
-            placeholder="首次启动见容器日志"
+            placeholder="至少 8 位"
             required
+            minlength="8"
           />
+          <div id="setup-confirm" class="field hidden">
+            <label for="login-password2">再输入一次</label>
+            <input
+              id="login-password2"
+              name="password2"
+              type="password"
+              autocomplete="new-password"
+              placeholder="确认密码"
+              minlength="8"
+            />
+          </div>
           <p id="login-error" class="field-error hidden" role="alert"></p>
-          <button type="submit" class="btn btn-primary">进入</button>
+          <button type="submit" id="login-submit-btn" class="btn btn-primary">进入</button>
         </form>
       </main>
     </div>
@@ -107,7 +119,7 @@
                 <h3>上报节点</h3>
                 <p class="card-sub">在网关或旁路由部署 agent 后出现在此</p>
               </div>
-              <button type="button" id="enroll-open-btn" class="btn btn-primary btn-sm">注册节点</button>
+              <button type="button" id="enroll-open-btn" class="btn btn-primary btn-sm">添加节点</button>
             </div>
             <div id="nodes-table-wrap"></div>
           </div>
@@ -130,10 +142,10 @@
     <dialog id="enroll-dialog" class="modal">
       <form id="enroll-form" method="dialog">
         <div class="modal-header">
-          <h3>注册节点</h3>
+          <h3>添加节点</h3>
           <button type="button" id="enroll-cancel-btn" class="btn-icon" aria-label="关闭">×</button>
         </div>
-        <p class="modal-lead">生成 agent 凭据。Token 明文只显示一次，请立即保存。</p>
+        <p class="modal-lead">生成一次性领取码，在目标机器上跑一条命令即可。不用复制 token。</p>
         <div class="field-row">
           <div class="field">
             <label for="enroll-site">站点 ID</label>
@@ -144,16 +156,27 @@
             <input id="enroll-node" name="node_id" required placeholder="proxy-20" />
           </div>
         </div>
+        <label class="check-field">
+          <input type="checkbox" id="enroll-local" name="local" />
+          本机即节点（server 和 agent 同机，Mihomo 默认 127.0.0.1:9090）
+        </label>
         <p id="enroll-error" class="field-error hidden" role="alert"></p>
         <div id="enroll-result" class="token-panel hidden">
-          <label>Agent Token</label>
-          <div class="token-row">
-            <code id="enroll-token"></code>
-            <button type="button" id="copy-token-btn" class="btn btn-secondary btn-sm">复制</button>
+          <label>领取码 <code id="enroll-token"></code> · 10 分钟内有效，只能用一次</label>
+          <div class="chip-group install-platforms" role="group" aria-label="安装平台">
+            <button type="button" class="chip-btn active" data-platform="linux">OpenWrt / Linux</button>
+            <button type="button" class="chip-btn" data-platform="macos">macOS</button>
+            <button type="button" class="chip-btn" data-platform="windows">Windows</button>
           </div>
+          <div class="token-row">
+            <code id="enroll-command"></code>
+            <button type="button" id="copy-token-btn" class="btn btn-secondary btn-sm">复制命令</button>
+          </div>
+          <p id="enroll-wait" class="wait-status">等待第一包上报…</p>
+          <p id="enroll-hint" class="note"></p>
         </div>
         <div class="modal-footer">
-          <button type="submit" id="enroll-submit-btn" class="btn btn-primary">生成 Token</button>
+          <button type="submit" id="enroll-submit-btn" class="btn btn-primary">生成安装命令</button>
         </div>
       </form>
     </dialog>

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/misakayyds/lantally/internal/server"
@@ -68,7 +69,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	cfg := server.Config{StaticFS: staticFS}
+	agentDir := strings.TrimSpace(os.Getenv("LANTALLY_AGENT_DIR"))
+	if agentDir == "" {
+		agentDir = "/usr/share/lantally/agents"
+	}
+	if _, err := os.Stat(agentDir); err != nil {
+		agentDir = ""
+	}
+	cfg := server.Config{StaticFS: staticFS, AgentDir: agentDir}
 	if endpoint := os.Getenv("LANTALLY_METRICS_URL"); endpoint != "" {
 		cfg.Metrics = metrics.NewWriter(endpoint, nil)
 	}

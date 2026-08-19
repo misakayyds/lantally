@@ -27,6 +27,14 @@ const enrollSubmitBtn = document.getElementById("enroll-submit-btn");
 const enrollCancelBtn = document.getElementById("enroll-cancel-btn");
 const enrollOpenBtn = document.getElementById("enroll-open-btn");
 const copyTokenBtn = document.getElementById("copy-token-btn");
+const enrollLocal = document.getElementById("enroll-local");
+const enrollCommand = document.getElementById("enroll-command");
+const enrollWait = document.getElementById("enroll-wait");
+const enrollHint = document.getElementById("enroll-hint");
+const loginModeLabel = document.getElementById("login-mode-label");
+const setupConfirm = document.getElementById("setup-confirm");
+const loginSubmitBtn = document.getElementById("login-submit-btn");
+const loginPassword2 = document.getElementById("login-password2");
 
 const RANGE_HOURS = { "24h": 24, "72h": 72, "7d": 168, "30d": 720 };
 const RANGE_TITLES = {
@@ -41,6 +49,11 @@ let currentDeviceId = "";
 let uiState = { range: "72h", group: "node" };
 let refreshTimer = null;
 let writingHash = false;
+let setupNeeded = false;
+let claimWaitTimer = null;
+let claimCommands = { linux: "", macos: "", windows: "" };
+let claimPlatform = "linux";
+let claimNodeId = "";
 
 function showToast(message) {
   toast.textContent = message;
@@ -114,7 +127,9 @@ function trafficParams(extra = {}) {
 function syncToolbar() {
   const toolbar = document.getElementById("chart-toolbar");
   const groupChips = document.getElementById("group-chips");
-  const showToolbar = ["overview", "nodes", "devices", "proxy"].includes(currentRoute);
+  const showToolbar =
+    ["overview", "nodes", "devices", "proxy"].includes(currentRoute) &&
+    !((currentRoute === "devices" || currentRoute === "nodes") && currentDeviceId);
   toolbar.hidden = !showToolbar;
   document.querySelectorAll("[data-range]").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.range === uiState.range);
@@ -137,7 +152,8 @@ function setRoute(route, id = "") {
     view.classList.toggle("active", view.dataset.view === route);
   });
 
-  pageTitle.textContent = route === "devices" && id ? "设备详情" : ROUTES[route].title;
+  pageTitle.textContent =
+    route === "devices" && id ? "设备详情" : route === "nodes" && id ? "节点详情" : ROUTES[route].title;
   pageEyebrow.textContent = ROUTES[route].eyebrow;
   syncToolbar();
 }
@@ -152,8 +168,18 @@ function formatBytes(value) {
     v /= 1024;
     i += 1;
   } while (v >= 1024 && i < units.length - 1);
-  const digits = v >= 10 ? 1 : 2;
-  return `${v.toFixed(digits)} ${units[i]}`;
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatLastSeen(iso) {
+  if (!iso) return "等待上报";
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return "等待上报";
+  const sec = (Date.now() - t.getTime()) / 1000;
+  if (sec < 45) return "刚刚";
+  if (sec < 3600) return `${Math.max(1, Math.floor(sec / 60))} 分钟前`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+  return formatStamp(t);
 }
 
 const CHART_PALETTE = [
@@ -447,7 +473,7 @@ function renderNodes(data) {
   renderTrafficChart(
     document.getElementById("nodes-chart"),
     data.traffic,
-    "节点上报后，按节点堆叠显示最近 72 小时流量。"
+    "节点上报后，按节点堆叠显示所选时间范围。"
   );
 
   const wrap = document.getElementById("nodes-table-wrap");
@@ -458,22 +484,26 @@ function renderNodes(data) {
       <div class="empty">
         ${EMPTY_ICON}
         <h3>还没有节点</h3>
-        <p>注册节点并部署 agent 后，上报会出现在这里。</p>
+        <p>添加节点并在目标机器上执行安装命令后，上报会出现在这里。</p>
       </div>`;
     return;
   }
 
   wrap.innerHTML = `
     <table>
-      <thead><tr><th>节点</th><th>站点</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
+      <thead><tr><th>节点</th><th>站点</th><th>最后上报</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
       <tbody>
         ${nodes
           .map((node) => {
             const bytes = node.bytes || {};
+            const id = node.id || node.ID || "";
+            const seen = formatLastSeen(node.last_seen_at);
+            const waiting = !node.last_seen_at;
             return `
-          <tr>
-            <td>${escapeHtml(node.id || node.ID || "")}</td>
+          <tr class="row-link" data-node="${escapeHtml(id)}">
+            <td>${escapeHtml(id)}</td>
             <td>${escapeHtml(node.site_id || node.SiteID || "")}</td>
+            <td class="${waiting ? "status-muted" : ""}">${escapeHtml(seen)}</td>
             <td>${formatBytes(bytes.total)}</td>
             <td>${formatBytes(bytes.direct)}</td>
             <td>${formatBytes(bytes.proxy_raw)}</td>
@@ -482,6 +512,65 @@ function renderNodes(data) {
           .join("")}
       </tbody>
     </table>`;
+  wrap.querySelectorAll("[data-node]").forEach((row) => {
+    row.addEventListener("click", () => writeHash("nodes", row.dataset.node));
+  });
+}
+
+function renderNodeDetail(node) {
+  const bytes = node.bytes || {};
+  const id = node.id || "";
+  const seen = formatLastSeen(node.last_seen_at);
+  document.getElementById("nodes-chart").innerHTML = "";
+  document.getElementById("nodes-table-wrap").innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>${escapeHtml(id)}</h3>
+          <p class="card-sub">站点 ${escapeHtml(node.site_id || "")} · ${escapeHtml(seen)}</p>
+        </div>
+        <button type="button" class="btn btn-text" id="node-back-btn">返回列表</button>
+      </div>
+      <div class="metrics">
+        <article class="metric">
+          <div class="metric-label">总量</div>
+          <div class="metric-value">${formatBytes(bytes.total)}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">直连</div>
+          <div class="metric-value">${formatBytes(bytes.direct)}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">代理</div>
+          <div class="metric-value">${formatBytes(bytes.proxy_raw)}</div>
+        </article>
+      </div>
+      <div class="device-actions">
+        <button type="button" id="node-reissue-btn" class="btn btn-secondary btn-sm">重新发放领取码</button>
+        <button type="button" id="node-revoke-btn" class="btn btn-secondary btn-sm">撤销节点</button>
+      </div>
+      <p class="note">${node.last_seen_at ? "已收到上报。" : "还没有第一包。把安装命令在目标机器上跑一次即可。"}</p>
+    </div>`;
+  document.getElementById("node-back-btn").addEventListener("click", () => writeHash("nodes"));
+  document.getElementById("node-reissue-btn").addEventListener("click", () => {
+    document.getElementById("enroll-site").value = node.site_id || "home";
+    document.getElementById("enroll-node").value = id;
+    resetEnrollDialog();
+    enrollDialog.showModal();
+  });
+  document.getElementById("node-revoke-btn").addEventListener("click", async () => {
+    if (!window.confirm(`撤销节点 ${id}？该节点的 token 立刻失效。`)) return;
+    const response = await api(`/v1/nodes/${encodeURIComponent(id)}/revoke`, {
+      method: "POST",
+      body: "{}",
+    });
+    if (!response.ok) {
+      showToast("撤销失败");
+      return;
+    }
+    showToast("节点已撤销");
+    writeHash("nodes");
+  });
 }
 
 function renderEmptyCard(containerId, title, description) {
@@ -829,6 +918,20 @@ function renderAlerts(data) {
 }
 
 async function loadView(route, id = "") {
+  if (route === "nodes" && id) {
+    const detailRes = await api(`/v1/nodes/${encodeURIComponent(id)}`);
+    if (detailRes.status === 401) {
+      setScreen(false);
+      stopAutoRefresh();
+      return false;
+    }
+    if (!detailRes.ok) {
+      showToast("加载节点失败");
+      return true;
+    }
+    renderNodeDetail(await detailRes.json());
+    return true;
+  }
   if (route === "devices" && id) {
     const detailRes = await api(`/v1/devices/${encodeURIComponent(id)}`);
     if (detailRes.status === 401) {
@@ -911,15 +1014,87 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function applyAuthMode() {
+  loginModeLabel.textContent = setupNeeded ? "首次设置" : "登录控制台";
+  setupConfirm.classList.toggle("hidden", !setupNeeded);
+  loginPassword2.required = setupNeeded;
+  loginSubmitBtn.textContent = setupNeeded ? "完成设置" : "进入";
+  document.getElementById("login-password").autocomplete = setupNeeded
+    ? "new-password"
+    : "current-password";
+}
+
+function stopClaimWait() {
+  if (claimWaitTimer) {
+    clearInterval(claimWaitTimer);
+    claimWaitTimer = null;
+  }
+}
+
+function showClaimCommand() {
+  enrollCommand.textContent = claimCommands[claimPlatform] || "";
+  document.querySelectorAll("[data-platform]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.platform === claimPlatform);
+  });
+}
+
+async function pollClaimNode() {
+  if (!claimNodeId) return;
+  const response = await api(`/v1/nodes/${encodeURIComponent(claimNodeId)}`);
+  if (response.status === 404) {
+    enrollWait.textContent = "等待领取码被兑换…";
+    enrollWait.classList.remove("ok");
+    return;
+  }
+  if (!response.ok) return;
+  const node = await response.json();
+  if (node.last_seen_at) {
+    enrollWait.textContent = "已收到第一包 ✓";
+    enrollWait.classList.add("ok");
+    stopClaimWait();
+    await loadView("nodes");
+    return;
+  }
+  enrollWait.textContent = "领取码已兑换，等待第一包上报…";
+  enrollWait.classList.remove("ok");
+}
+
+function startClaimWait(nodeId) {
+  claimNodeId = nodeId;
+  stopClaimWait();
+  pollClaimNode();
+  claimWaitTimer = setInterval(pollClaimNode, 2000);
+}
+
 function resetEnrollDialog() {
   enrollError.classList.add("hidden");
   enrollResult.classList.add("hidden");
   enrollToken.textContent = "";
-  enrollSubmitBtn.textContent = "生成 Token";
+  enrollCommand.textContent = "";
+  enrollHint.textContent = "";
+  enrollWait.textContent = "等待第一包上报…";
+  enrollWait.classList.remove("ok");
+  enrollSubmitBtn.textContent = "生成安装命令";
   enrollSubmitBtn.disabled = false;
+  claimCommands = { linux: "", macos: "", windows: "" };
+  claimPlatform = "linux";
+  stopClaimWait();
 }
 
 async function bootstrap() {
+  try {
+    const setupRes = await fetch("/v1/setup", { credentials: "same-origin" });
+    if (setupRes.ok) {
+      setupNeeded = Boolean((await setupRes.json()).needed);
+    }
+  } catch {
+    setupNeeded = false;
+  }
+  applyAuthMode();
+  if (setupNeeded) {
+    setScreen(false);
+    return;
+  }
   const parsed = parseHash();
   const ok = await loadView("overview");
   if (!ok) {
@@ -935,7 +1110,38 @@ async function bootstrap() {
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   loginError.classList.add("hidden");
-  const password = new FormData(loginForm).get("password");
+  const password = String(new FormData(loginForm).get("password") || "");
+  if (setupNeeded) {
+    const again = String(loginPassword2.value || "");
+    if (password.length < 8) {
+      loginError.textContent = "密码至少 8 位";
+      loginError.classList.remove("hidden");
+      return;
+    }
+    if (password !== again) {
+      loginError.textContent = "两次输入的密码不一致";
+      loginError.classList.remove("hidden");
+      return;
+    }
+    const response = await api("/v1/setup", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
+    if (!response.ok) {
+      loginError.textContent = response.status === 409 ? "已经设置过管理员" : "设置失败";
+      loginError.classList.remove("hidden");
+      return;
+    }
+    setupNeeded = false;
+    applyAuthMode();
+    loginForm.reset();
+    setScreen(true);
+    setRoute("overview");
+    writeHash("overview");
+    await refreshCurrent();
+    startAutoRefresh();
+    return;
+  }
   const response = await api("/v1/login", {
     method: "POST",
     body: JSON.stringify({ password }),
@@ -956,6 +1162,7 @@ loginForm.addEventListener("submit", async (event) => {
 logoutBtn.addEventListener("click", async () => {
   await api("/v1/logout", { method: "POST", body: "{}" });
   stopAutoRefresh();
+  stopClaimWait();
   setScreen(false);
   location.hash = "";
 });
@@ -1001,38 +1208,54 @@ enrollForm.addEventListener("submit", async (event) => {
   const formData = new FormData(enrollForm);
   const site_id = String(formData.get("site_id") || "").trim();
   const node_id = String(formData.get("node_id") || "").trim();
+  const local = Boolean(enrollLocal.checked);
   if (!site_id || !node_id) return;
 
-  const response = await api("/v1/enroll", {
+  const response = await api("/v1/claims", {
     method: "POST",
-    body: JSON.stringify({ site_id, node_id }),
+    body: JSON.stringify({ site_id, node_id, local }),
   });
 
   if (!response.ok) {
-    enrollError.textContent =
-      response.status === 409 ? "节点 ID 已存在" : "注册失败";
+    enrollError.textContent = "生成领取码失败";
     enrollError.classList.remove("hidden");
     return;
   }
 
   const data = await response.json();
-  enrollToken.textContent = data.token || "";
+  enrollToken.textContent = data.code || "";
+  claimCommands = {
+    linux: data.linux || "",
+    macos: data.macos || "",
+    windows: data.windows || "",
+  };
+  enrollHint.textContent = data.mihomo_hint || (local ? "" : "安装脚本会只读探测本机 Mihomo，密钥不会上传。");
   enrollResult.classList.remove("hidden");
   enrollSubmitBtn.textContent = "已生成";
   enrollSubmitBtn.disabled = true;
+  showClaimCommand();
+  startClaimWait(node_id);
   await loadView("nodes");
-  showToast("节点已注册");
+  showToast("领取码已生成");
 });
 
 copyTokenBtn.addEventListener("click", async () => {
-  const token = enrollToken.textContent;
-  if (!token) return;
+  const text = enrollCommand.textContent || enrollToken.textContent;
+  if (!text) return;
   try {
-    await navigator.clipboard.writeText(token);
+    await navigator.clipboard.writeText(text);
     showToast("已复制");
   } catch {
     showToast("请手动复制");
   }
+});
+
+document.querySelector(".install-platforms").addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-platform]");
+  if (!btn) return;
+  event.preventDefault();
+  claimPlatform = btn.dataset.platform;
+  showClaimCommand();
 });
 
 bootstrap();

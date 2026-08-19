@@ -4,7 +4,28 @@
 
 LanTally is a privacy-first, self-hosted traffic ledger for home and small networks. Lightweight agents report per-device usage to a central server, which separates direct and proxied traffic, accounts for proxy-node multipliers, and presents a unified history across multiple gateways.
 
-> Status: v0.1 design and implementation plan are approved. Milestone 1 is on `main`. There is no working release yet; follow the plan. Source: https://github.com/misakayyds/lantally
+> Source: https://github.com/misakayyds/lantally · First installable image lands with v0.1.0 (`ghcr.io/misakayyds/lantally`). Until that tag is published, build the compose file locally.
+
+## Quick start
+
+1. Run the server (one container, one port, one volume):
+
+```bash
+docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:latest
+```
+
+Or from this repo:
+
+```bash
+docker compose -f deploy/docker/compose.yaml up --build
+```
+
+2. Open `http://<host>:8080` and set the admin password in the first-run wizard.
+3. Click **Add node**, copy the one-line install command, and run it on the gateway or on the same machine as the server. The page waits until the first batch arrives.
+
+The installer reads a local Mihomo/OpenClash config if present and never uploads the secret. A laptop-only setup works too: check **This machine is the node** and point Mihomo at `127.0.0.1:9090`.
+
+Put a public deployment behind HTTPS. Claim codes are short-lived (10 minutes, one use) and travel in the install command.
 
 ## v0.1 scope
 

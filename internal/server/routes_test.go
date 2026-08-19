@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,6 +33,25 @@ func TestEnsureFirstRunAdminUsesBootstrapEnv(t *testing.T) {
 	}
 	if err := store.AuthenticateAdmin("bootstrap-test-password"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnsureFirstRunAdminLeavesSetupToWizard(t *testing.T) {
+	t.Setenv("LANTALLY_BOOTSTRAP_ADMIN_PASSWORD", "")
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "lantally.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := EnsureFirstRunAdmin(store, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	has, err := store.HasAdminCredential()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("wizard mode must not create a generated admin password")
 	}
 }
 
@@ -589,4 +609,191 @@ func TestProxyBillingComputesRatio(t *testing.T) {
 
 func itoa(n int64) string {
 	return strconv.FormatInt(n, 10)
+}
+
+func TestSetupWizardCreatesAdminOnce(t *testing.T) {
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "lantally.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	handler := Routes(store, Config{})
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/v1/setup", nil)
+	statusRec := httptest.NewRecorder()
+	handler.ServeHTTP(statusRec, statusReq)
+	if statusRec.Code != http.StatusOK || !strings.Contains(statusRec.Body.String(), `"needed":true`) {
+		t.Fatalf("setup status = %d %s", statusRec.Code, statusRec.Body.String())
+	}
+
+	create := httptest.NewRequest(http.MethodPost, "/v1/setup", strings.NewReader(`{"password":"first-admin-pass"}`))
+	create.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, create)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("setup = %d %s", createRec.Code, createRec.Body.String())
+	}
+	if len(createRec.Result().Cookies()) == 0 {
+		t.Fatal("setup should log the admin in")
+	}
+	if err := store.AuthenticateAdmin("first-admin-pass"); err != nil {
+		t.Fatal(err)
+	}
+
+	again := httptest.NewRequest(http.MethodPost, "/v1/setup", strings.NewReader(`{"password":"other-pass"}`))
+	again.Header.Set("Content-Type", "application/json")
+	againRec := httptest.NewRecorder()
+	handler.ServeHTTP(againRec, again)
+	if againRec.Code != http.StatusConflict {
+		t.Fatalf("second setup = %d, want 409", againRec.Code)
+	}
+}
+
+func TestClaimCodeRedeemsOnceAndServesInstallScript(t *testing.T) {
+	store, err := sqlitestore.Open("file:r5-claim-http?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateAdminCredential("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	handler := Routes(store, Config{})
+	cookie := loginCookie(t, handler, "test-password")
+
+	create := httptest.NewRequest(http.MethodPost, "/v1/claims", strings.NewReader(`{"site_id":"home","node_id":"laptop","local":true}`))
+	create.Header.Set("Content-Type", "application/json")
+	create.Host = "lantally.example.test:8080"
+	create.AddCookie(cookie)
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, create)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("claim = %d %s", createRec.Code, createRec.Body.String())
+	}
+	var issued struct {
+		Code    string `json:"code"`
+		Linux   string `json:"linux"`
+		MacOS   string `json:"macos"`
+		Windows string `json:"windows"`
+		Local   bool   `json:"local"`
+		Mihomo  string `json:"mihomo_hint"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(createRec.Body.Bytes())).Decode(&issued); err != nil {
+		t.Fatal(err)
+	}
+	if issued.Code == "" || !strings.Contains(issued.Linux, issued.Code) || !issued.Local {
+		t.Fatalf("issued claim = %+v", issued)
+	}
+	if !strings.Contains(issued.Mihomo, "127.0.0.1:9090") {
+		t.Fatalf("local mode should hint loopback mihomo: %+v", issued)
+	}
+	if !strings.Contains(issued.Windows, "LANTALLY_CLAIM='"+issued.Code+"'") {
+		t.Fatalf("windows command should embed claim: %+v", issued)
+	}
+
+	script := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	scriptRec := httptest.NewRecorder()
+	handler.ServeHTTP(scriptRec, script)
+	if scriptRec.Code != http.StatusOK || !strings.Contains(scriptRec.Body.String(), "/v1/claim") {
+		t.Fatalf("install.sh = %d %s", scriptRec.Code, scriptRec.Body.String())
+	}
+	ps1 := httptest.NewRequest(http.MethodGet, "/install.ps1", nil)
+	ps1Rec := httptest.NewRecorder()
+	handler.ServeHTTP(ps1Rec, ps1)
+	if ps1Rec.Code != http.StatusOK || !strings.Contains(ps1Rec.Body.String(), "/v1/claim") {
+		t.Fatalf("install.ps1 = %d %s", ps1Rec.Code, ps1Rec.Body.String())
+	}
+
+	redeem := httptest.NewRequest(http.MethodPost, "/v1/claim", strings.NewReader(`{"code":"`+issued.Code+`"}`))
+	redeem.Header.Set("Content-Type", "application/json")
+	redeemRec := httptest.NewRecorder()
+	handler.ServeHTTP(redeemRec, redeem)
+	if redeemRec.Code != http.StatusOK {
+		t.Fatalf("redeem = %d %s", redeemRec.Code, redeemRec.Body.String())
+	}
+	var tokenBody struct {
+		Token  string `json:"token"`
+		SiteID string `json:"site_id"`
+		NodeID string `json:"node_id"`
+		Local  bool   `json:"local"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(redeemRec.Body.Bytes())).Decode(&tokenBody); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := enroll.CredentialID(tokenBody.Token); !ok || tokenBody.NodeID != "laptop" || !tokenBody.Local {
+		t.Fatalf("redeemed = %+v", tokenBody)
+	}
+
+	again := httptest.NewRequest(http.MethodPost, "/v1/claim", strings.NewReader(`{"code":"`+issued.Code+`"}`))
+	again.Header.Set("Content-Type", "application/json")
+	againRec := httptest.NewRecorder()
+	handler.ServeHTTP(againRec, again)
+	if againRec.Code != http.StatusConflict {
+		t.Fatalf("second redeem = %d, want 409", againRec.Code)
+	}
+
+	detail := httptest.NewRequest(http.MethodGet, "/v1/nodes/laptop", nil)
+	detail.AddCookie(cookie)
+	detailRec := httptest.NewRecorder()
+	handler.ServeHTTP(detailRec, detail)
+	if detailRec.Code != http.StatusOK || !strings.Contains(detailRec.Body.String(), `"id":"laptop"`) {
+		t.Fatalf("node detail = %d %s", detailRec.Code, detailRec.Body.String())
+	}
+	if !strings.Contains(detailRec.Body.String(), `"online":false`) {
+		t.Fatalf("new node should wait for first batch: %s", detailRec.Body.String())
+	}
+
+	revoke := httptest.NewRequest(http.MethodPost, "/v1/nodes/laptop/revoke", nil)
+	revoke.AddCookie(cookie)
+	revokeRec := httptest.NewRecorder()
+	handler.ServeHTTP(revokeRec, revoke)
+	if revokeRec.Code != http.StatusOK {
+		t.Fatalf("revoke = %d %s", revokeRec.Code, revokeRec.Body.String())
+	}
+	gone := httptest.NewRequest(http.MethodGet, "/v1/nodes/laptop", nil)
+	gone.AddCookie(cookie)
+	goneRec := httptest.NewRecorder()
+	handler.ServeHTTP(goneRec, gone)
+	if goneRec.Code != http.StatusNotFound {
+		t.Fatalf("revoked node detail = %d, want 404", goneRec.Code)
+	}
+}
+
+func TestAgentBinaryServedFromAgentDir(t *testing.T) {
+	store, err := sqlitestore.Open("file:r5-agent-bin?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "linux", "amd64")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "lantally-agent"), []byte("fake-agent"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := Routes(store, Config{AgentDir: dir})
+
+	req := httptest.NewRequest(http.MethodGet, "/agents/linux/amd64", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "fake-agent" {
+		t.Fatalf("agent binary = %d %q", rec.Code, rec.Body.String())
+	}
+
+	missing := httptest.NewRequest(http.MethodGet, "/agents/linux/mips", nil)
+	missingRec := httptest.NewRecorder()
+	handler.ServeHTTP(missingRec, missing)
+	if missingRec.Code != http.StatusNotFound {
+		t.Fatalf("missing agent = %d, want 404", missingRec.Code)
+	}
+
+	empty := Routes(store, Config{})
+	emptyRec := httptest.NewRecorder()
+	empty.ServeHTTP(emptyRec, httptest.NewRequest(http.MethodGet, "/agents/linux/amd64", nil))
+	if emptyRec.Code != http.StatusNotFound {
+		t.Fatalf("empty AgentDir = %d, want 404", emptyRec.Code)
+	}
 }

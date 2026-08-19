@@ -29,8 +29,10 @@ type Store struct {
 }
 
 type Node struct {
-	ID     string `json:"id"`
-	SiteID string `json:"site_id"`
+	ID         string `json:"id"`
+	SiteID     string `json:"site_id"`
+	LastSeenAt string `json:"last_seen_at,omitempty"`
+	LastBootID string `json:"last_boot_id,omitempty"`
 }
 
 type DeviceLedger struct {
@@ -190,6 +192,13 @@ func applyMigrations(db *sql.DB) error {
 	if err := addNodeColumn(db, "last_boot_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	claimsMigration, err := migrations.ReadFile("migrations/0011_claim_codes.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(claimsMigration)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -239,6 +248,8 @@ func tableHasColumn(db *sql.DB, table, column string) (bool, error) {
 }
 
 func (s *Store) Close() error {
+	// Drop idle connections so Windows can unlink the TempDir database.
+	s.db.SetMaxIdleConns(0)
 	return s.db.Close()
 }
 
@@ -263,7 +274,7 @@ func (s *Store) CreateNode(
 }
 
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id FROM nodes WHERE revoked = 0 ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id, last_seen_at, last_boot_id FROM nodes WHERE revoked = 0 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -272,12 +283,25 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	var nodes []Node
 	for rows.Next() {
 		var node Node
-		if err := rows.Scan(&node.ID, &node.SiteID); err != nil {
+		if err := rows.Scan(&node.ID, &node.SiteID, &node.LastSeenAt, &node.LastBootID); err != nil {
 			return nil, err
 		}
 		nodes = append(nodes, node)
 	}
 	return nodes, rows.Err()
+}
+
+func (s *Store) GetNode(ctx context.Context, id string) (Node, error) {
+	var node Node
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, site_id, last_seen_at, last_boot_id FROM nodes WHERE id = ? AND revoked = 0`,
+		id,
+	).Scan(&node.ID, &node.SiteID, &node.LastSeenAt, &node.LastBootID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Node{}, err
+	}
+	return node, err
 }
 
 func (s *Store) RevokeNode(ctx context.Context, id string) error {

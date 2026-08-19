@@ -7,11 +7,19 @@
 - VictoriaMetrics listens on `127.0.0.1:8428` inside the container
 - SQLite metadata lives at `/var/lib/lantally/meta/lantally.db`
 
-Start locally:
+Start:
+
+```bash
+docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:latest
+```
+
+The GHCR tag is published with v0.1.0. Until then, build locally:
 
 ```bash
 docker compose -f deploy/docker/compose.yaml up --build
 ```
+
+The image serves agent binaries from `LANTALLY_AGENT_DIR` (`/usr/share/lantally/agents`). Open the UI, set the admin password, then add a node with a one-time claim code. Agent install scripts are `GET /install.sh` and `GET /install.ps1`.
 
 Health:
 

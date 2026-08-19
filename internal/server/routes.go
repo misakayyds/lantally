@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"database/sql"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,22 +12,26 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/misakayyds/lantally/internal/identity"
-
 	"github.com/misakayyds/lantally/internal/enroll"
+	"github.com/misakayyds/lantally/internal/identity"
 	"github.com/misakayyds/lantally/internal/ingest"
 	"github.com/misakayyds/lantally/internal/store/metrics"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
 )
 
+//go:embed install.sh install.ps1
+var installFiles embed.FS
+
 type Config struct {
 	StaticFS fs.FS
 	Metrics  *metrics.Writer
+	AgentDir string
 }
 
 type sessionStore struct {
@@ -68,7 +73,14 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("GET /healthz", ingestHandler.Healthz)
 	mux.HandleFunc("POST /v1/login", loginHandler(store, sessions))
 	mux.HandleFunc("POST /v1/logout", logoutHandler(sessions))
+	mux.HandleFunc("GET /v1/setup", setupStatusHandler(store))
+	mux.HandleFunc("POST /v1/setup", setupHandler(store, sessions))
 	mux.HandleFunc("POST /v1/enroll", requireSession(sessions, enrollHandler(store)))
+	mux.HandleFunc("POST /v1/claims", requireSession(sessions, createClaimHandler(store)))
+	mux.HandleFunc("POST /v1/claim", redeemClaimHandler(store))
+	mux.HandleFunc("GET /install.sh", installScriptHandler("install.sh"))
+	mux.HandleFunc("GET /install.ps1", installScriptHandler("install.ps1"))
+	mux.HandleFunc("GET /agents/{os}/{arch}", agentBinaryHandler(cfg.AgentDir))
 	mux.HandleFunc("GET /v1/overview", requireSession(sessions, overviewHandler(store)))
 	mux.HandleFunc("GET /v1/traffic", requireSession(sessions, trafficHandler(store)))
 	mux.HandleFunc("GET /v1/devices", requireSession(sessions, devicesHandler(store)))
@@ -77,6 +89,8 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{id}/merge", requireSession(sessions, mergeDeviceHandler(store)))
 	mux.HandleFunc("POST /v1/devices/{id}/unmerge", requireSession(sessions, unmergeDeviceHandler(store)))
 	mux.HandleFunc("GET /v1/nodes", requireSession(sessions, nodesHandler(store)))
+	mux.HandleFunc("GET /v1/nodes/{id}", requireSession(sessions, nodeDetailHandler(store)))
+	mux.HandleFunc("POST /v1/nodes/{id}/revoke", requireSession(sessions, revokeNodeHandler(store)))
 	mux.HandleFunc("GET /v1/proxy", requireSession(sessions, proxyHandler(store)))
 	mux.HandleFunc("PUT /v1/proxy/multipliers", requireSession(sessions, setMultiplierHandler(store)))
 	mux.HandleFunc("PUT /v1/proxy/billing", requireSession(sessions, setBillingHandler(store)))
@@ -147,6 +161,182 @@ func logoutHandler(sessions *sessionStore) http.HandlerFunc {
 		})
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
+}
+
+func setupStatusHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		has, err := store.HasAdminCredential()
+		if err != nil {
+			http.Error(w, "setup unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"needed": !has})
+	}
+}
+
+func setupHandler(store *sqlitestore.Store, sessions *sessionStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		has, err := store.HasAdminCredential()
+		if err != nil {
+			http.Error(w, "setup unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if has {
+			http.Error(w, "already set up", http.StatusConflict)
+			return
+		}
+		var body struct {
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid setup", http.StatusBadRequest)
+			return
+		}
+		body.Password = strings.TrimSpace(body.Password)
+		if len(body.Password) < 8 {
+			http.Error(w, "password too short", http.StatusBadRequest)
+			return
+		}
+		if err := store.CreateAdminCredential(body.Password); err != nil {
+			http.Error(w, "setup failed", http.StatusConflict)
+			return
+		}
+		token, err := sessions.create()
+		if err != nil {
+			http.Error(w, "session unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "lantally_session",
+			Value:    token,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func createClaimHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SiteID string `json:"site_id"`
+			NodeID string `json:"node_id"`
+			Local  bool   `json:"local"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid claim", http.StatusBadRequest)
+			return
+		}
+		body.SiteID = strings.TrimSpace(body.SiteID)
+		body.NodeID = strings.TrimSpace(body.NodeID)
+		if body.SiteID == "" || body.NodeID == "" {
+			http.Error(w, "site_id and node_id are required", http.StatusBadRequest)
+			return
+		}
+		claim, err := store.CreateClaim(r.Context(), body.SiteID, body.NodeID, body.Local, time.Now().UTC())
+		if err != nil {
+			http.Error(w, "claim unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		base := publicBase(r)
+		mihomoHint := ""
+		if body.Local {
+			mihomoHint = "本机 Mihomo 默认 127.0.0.1:9090。探测不到则只记网卡总量。"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":        claim.Code,
+			"expires_at":  claim.ExpiresAt.UTC().Format(time.RFC3339),
+			"local":       claim.Local,
+			"linux":       `sh -c "$(wget -qO- ` + base + `/install.sh)" -- ` + claim.Code,
+			"macos":       `curl -fsSL ` + base + `/install.sh | sh -s -- ` + claim.Code,
+			"windows":     `$env:LANTALLY_CLAIM='` + claim.Code + `'; irm ` + base + `/install.ps1 | iex`,
+			"mihomo_hint": mihomoHint,
+		})
+	}
+}
+
+func redeemClaimHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid claim", http.StatusBadRequest)
+			return
+		}
+		claim, err := store.RedeemClaim(r.Context(), strings.TrimSpace(body.Code), time.Now().UTC())
+		if errors.Is(err, sqlitestore.ErrClaimNotFound) {
+			http.Error(w, "claim not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, sqlitestore.ErrClaimUsed) || errors.Is(err, sqlitestore.ErrClaimExpired) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		if err != nil {
+			http.Error(w, "claim unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		token, credentialID, err := enroll.IssueToken()
+		if err != nil {
+			http.Error(w, "token unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := store.UpsertNodeToken(r.Context(), claim.NodeID, claim.SiteID, credentialID, enroll.HashToken(token)); err != nil {
+			http.Error(w, "enroll failed", http.StatusConflict)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"token":   token,
+			"site_id": claim.SiteID,
+			"node_id": claim.NodeID,
+			"local":   claim.Local,
+		})
+	}
+}
+
+func installScriptHandler(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, err := installFiles.ReadFile(name)
+		if err != nil {
+			http.Error(w, "script unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		body := strings.ReplaceAll(string(raw), "__SERVER_URL__", publicBase(r))
+		if strings.HasSuffix(name, ".ps1") {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		} else {
+			w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+		}
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+func agentBinaryHandler(dir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(dir) == "" {
+			http.Error(w, "agent binaries not packaged", http.StatusNotFound)
+			return
+		}
+		osName := filepath.Base(r.PathValue("os"))
+		arch := filepath.Base(r.PathValue("arch"))
+		name := "lantally-agent"
+		if osName == "windows" {
+			name += ".exe"
+		}
+		path := filepath.Join(dir, osName, arch, name)
+		http.ServeFile(w, r, path)
+	}
+}
+
+func publicBase(r *http.Request) string {
+	proto := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		proto = "https"
+	}
+	return proto + "://" + r.Host
 }
 
 func enrollHandler(store *sqlitestore.Store) http.HandlerFunc {
@@ -449,9 +639,11 @@ func nodesHandler(store *sqlitestore.Store) http.HandlerFunc {
 				return
 			}
 			out = append(out, map[string]any{
-				"id":      node.ID,
-				"site_id": node.SiteID,
-				"bytes":   bytes,
+				"id":           node.ID,
+				"site_id":      node.SiteID,
+				"last_seen_at": node.LastSeenAt,
+				"last_boot_id": node.LastBootID,
+				"bytes":        bytes,
 			})
 		}
 		traffic, err := lastTraffic(store, r, "node", "total")
@@ -460,6 +652,43 @@ func nodesHandler(store *sqlitestore.Store) http.HandlerFunc {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": out, "traffic": traffic})
+	}
+}
+
+func nodeDetailHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		node, err := store.GetNode(r.Context(), r.PathValue("id"))
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "node not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, "node unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		bytes, err := store.NodeLedgerTotals(r.Context(), node.SiteID, node.ID)
+		if err != nil {
+			http.Error(w, "node unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":           node.ID,
+			"site_id":      node.SiteID,
+			"last_seen_at": node.LastSeenAt,
+			"last_boot_id": node.LastBootID,
+			"bytes":        bytes,
+			"online":       strings.TrimSpace(node.LastSeenAt) != "",
+		})
+	}
+}
+
+func revokeNodeHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := store.RevokeNode(r.Context(), r.PathValue("id")); err != nil {
+			http.Error(w, "revoke failed", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }
 
@@ -547,9 +776,9 @@ func parseTrafficQuery(r *http.Request) (sqlitestore.TrafficQuery, error) {
 	return query, nil
 }
 
-// EnsureFirstRunAdmin creates a one-time admin password when none exists.
-// If LANTALLY_BOOTSTRAP_ADMIN_PASSWORD is set and no admin exists yet, that
-// value is used instead of generating a random password.
+// EnsureFirstRunAdmin creates an admin password only when
+// LANTALLY_BOOTSTRAP_ADMIN_PASSWORD is set and no admin exists yet.
+// Otherwise the first-run web wizard sets the password.
 func EnsureFirstRunAdmin(store *sqlitestore.Store, stdout io.Writer) error {
 	hasAdmin, err := store.HasAdminCredential()
 	if err != nil {
@@ -558,24 +787,17 @@ func EnsureFirstRunAdmin(store *sqlitestore.Store, stdout io.Writer) error {
 	if hasAdmin {
 		return nil
 	}
-	password, err := bootstrapAdminPassword()
-	if err != nil {
-		return err
+	envPassword := strings.TrimSpace(os.Getenv("LANTALLY_BOOTSTRAP_ADMIN_PASSWORD"))
+	if envPassword == "" {
+		return nil
 	}
-	if err := store.CreateAdminCredential(password.value); err != nil {
-		return err
-	}
-	if password.fromEnv {
-		if stdout == nil {
-			stdout = io.Discard
-		}
-		_, err = fmt.Fprintln(stdout, "LanTally admin password loaded from LANTALLY_BOOTSTRAP_ADMIN_PASSWORD")
+	if err := store.CreateAdminCredential(envPassword); err != nil {
 		return err
 	}
 	if stdout == nil {
 		stdout = io.Discard
 	}
-	_, err = fmt.Fprintf(stdout, "LanTally admin password (shown once): %s\n", password.value)
+	_, err = fmt.Fprintln(stdout, "LanTally admin password loaded from LANTALLY_BOOTSTRAP_ADMIN_PASSWORD")
 	return err
 }
 
