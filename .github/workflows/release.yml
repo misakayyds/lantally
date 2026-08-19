@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -75,9 +76,15 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          IMAGE: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/release/* \
-            --title "LanTally ${{ github.ref_name }}" \
-            --notes "Install: docker run -d -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-Open the UI, set an admin password, then add a node with the one-line claim command.
-Public deployments must sit behind HTTPS. Ingest protocol_version remains 1."
+          cat > /tmp/release-notes.md <<EOF
+          Install: docker run -d -p 8080:8080 -v lantally:/var/lib/lantally ${IMAGE}
+
+          Open the UI, set an admin password, then add a node with the one-line claim command.
+          Public deployments must sit behind HTTPS. Ingest protocol_version remains 1.
+          EOF
+          gh release create "${RELEASE_TAG}" dist/release/* \
+            --title "LanTally ${RELEASE_TAG}" \
+            --notes-file /tmp/release-notes.md
