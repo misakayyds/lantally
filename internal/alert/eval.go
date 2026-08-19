@@ -15,12 +15,13 @@ const (
 )
 
 type Record struct {
-	Kind       Kind
-	SiteID     string
-	NodeID     string
-	DeviceID   string
-	Message    string
-	ObservedAt time.Time
+	Kind        Kind
+	SiteID      string
+	NodeID      string
+	DeviceID    string
+	Message     string
+	ObservedAt  time.Time
+	Fingerprint string
 }
 
 type GrowthConfig struct {

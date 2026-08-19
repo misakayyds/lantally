@@ -45,6 +45,22 @@ func (s *Store) AuthenticateAdmin(password string) error {
 	return nil
 }
 
+func (s *Store) UpdateAdminPassword(current, next string) error {
+	if err := s.AuthenticateAdmin(current); err != nil {
+		return err
+	}
+	next = strings.TrimSpace(next)
+	if len(next) < 8 {
+		return fmt.Errorf("password too short")
+	}
+	hash, err := hashAdminPassword(next)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE admin_credentials SET password_hash = ? WHERE id = 1`, hash)
+	return err
+}
+
 func hashAdminPassword(password string) ([]byte, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {

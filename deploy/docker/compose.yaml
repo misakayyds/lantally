@@ -1,5 +1,6 @@
 services:
   lantally:
+    image: ghcr.io/misakayyds/lantally:latest
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
@@ -7,6 +8,9 @@ services:
       - "8080:8080"
     volumes:
       - lantally-data:/var/lib/lantally
+    environment:
+      LANTALLY_AGENT_DIR: /usr/share/lantally/agents
+      # LANTALLY_DEMO: "1"
 
 volumes:
   lantally-data:

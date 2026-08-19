@@ -364,6 +364,98 @@ input:focus {
 
 .page-header {
   margin-bottom: 1.25rem;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.chart-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.chip-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.chip-btn {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.32rem 0.7rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.chip-btn.active {
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+
+.chip-btn:hover:not(.active) {
+  color: var(--text);
+}
+
+.row-link {
+  cursor: pointer;
+}
+
+.device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  align-items: flex-end;
+  padding: 1rem 1.15rem;
+}
+
+.device-actions .field {
+  flex: 1;
+  min-width: 12rem;
+}
+
+.factor-input {
+  width: 5.5rem;
+  padding: 0.35rem 0.45rem;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.note {
+  margin: 0;
+  padding: 0 1.15rem 1rem;
+  color: var(--text-tertiary);
+  font-size: 0.82rem;
+}
+
+.back-link {
+  display: inline-block;
+  margin-bottom: 0.35rem;
+  color: var(--brand);
+  text-decoration: none;
+  font-size: 0.86rem;
+  font-weight: 600;
 }
 
 .page-kicker {
@@ -833,6 +925,38 @@ tbody tr:last-child td {
   width: auto;
 }
 
+.check-field {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin: 0.85rem 0 0.5rem;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+}
+
+.check-field input {
+  margin-top: 0.2rem;
+}
+
+.install-platforms {
+  margin: 0.65rem 0 0.55rem;
+}
+
+.wait-status {
+  margin: 0.75rem 0 0;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+}
+
+.wait-status.ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.status-muted {
+  color: var(--text-tertiary);
+}
+
 /* —— Toast —— */
 .toast {
   position: fixed;
@@ -877,11 +1001,27 @@ tbody tr:last-child td {
     grid-row: 1;
   }
 
+@media (max-width: 640px) {
   .metrics {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
   }
 
-  .field-row {
-    grid-template-columns: 1fr;
+  .page-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chart-toolbar,
+  .chip-group {
+    width: 100%;
+  }
+
+  .chip-group {
+    border-radius: 12px;
+  }
+
+  .device-actions {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

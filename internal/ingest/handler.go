@@ -8,8 +8,10 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/misakayyds/lantally/internal/accounting"
+	"github.com/misakayyds/lantally/internal/alert"
 	"github.com/misakayyds/lantally/internal/identity"
 	"github.com/misakayyds/lantally/internal/protocol"
 	"github.com/misakayyds/lantally/internal/store/metrics"
@@ -69,6 +71,11 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	batch, err := protocol.Decode(raw)
+	var ver protocol.VersionError
+	if errors.As(err, &ver) {
+		http.Error(w, ver.Error(), http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		http.Error(w, "invalid batch", http.StatusBadRequest)
 		return
@@ -97,6 +104,10 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+	if err := h.observeNode(r.Context(), batch, inserted); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
@@ -118,7 +129,11 @@ func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
-	increments := accounting.NodeIncrements(batch, nil)
+	multipliers, err := h.store.ListMultipliers(ctx)
+	if err != nil {
+		return err
+	}
+	increments := accounting.NodeIncrements(batch, multipliers)
 	resolver := identity.NewResolver(h.store, batch.NodeID)
 	for _, obs := range batch.Devices {
 		deviceID, _, err := resolver.Resolve(batch.SiteID, obs, batch.SampledAt)
@@ -128,7 +143,7 @@ func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
 			}
 			return err
 		}
-		increments = append(increments, accounting.DeviceIncrements(obs, deviceID, nil)...)
+		increments = append(increments, accounting.DeviceIncrements(obs, deviceID, multipliers)...)
 	}
 	applied, err := h.store.ApplyLedgerOnce(
 		ctx,
@@ -149,6 +164,47 @@ func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
 		}
 	}
 	return nil
+}
+
+func (h *Handler) observeNode(ctx context.Context, batch protocol.Batch, inserted bool) error {
+	prevBoot, err := h.store.LastBootID(ctx, batch.NodeID)
+	if err != nil {
+		return err
+	}
+	interval := time.Duration(batch.IntervalMS) * time.Millisecond
+	if err := h.store.TouchNode(ctx, batch.NodeID, batch.BootID, interval, time.Now().UTC()); err != nil {
+		return err
+	}
+	if !inserted {
+		return h.store.ResolveFingerprint(ctx, "silence|"+batch.NodeID, time.Now().UTC())
+	}
+	if prevBoot != "" && prevBoot != batch.BootID {
+		rec, fired := alert.EvalReset(true, "")
+		if fired {
+			rec.SiteID = batch.SiteID
+			rec.NodeID = batch.NodeID
+			rec.ObservedAt = time.Now().UTC()
+			rec.Fingerprint = "reset|" + batch.NodeID + "|" + batch.BootID
+			if err := h.store.RaiseAlert(ctx, rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, gap := range batch.Gaps {
+		rec, fired := alert.EvalReset(false, string(gap.Reason))
+		if !fired {
+			continue
+		}
+		rec.SiteID = batch.SiteID
+		rec.NodeID = batch.NodeID
+		rec.ObservedAt = time.Now().UTC()
+		rec.Fingerprint = "reset|" + batch.NodeID + "|" + string(gap.Reason) + "|" + gap.From.UTC().Format(time.RFC3339)
+		if err := h.store.RaiseAlert(ctx, rec); err != nil {
+			return err
+		}
+	}
+	return h.store.ResolveFingerprint(ctx, "silence|"+batch.NodeID, time.Now().UTC())
 }
 
 func ledgerSamples(siteID, nodeID string, totals map[string]uint64) []metrics.Sample {

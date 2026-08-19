@@ -2,7 +2,10 @@
 
 ## Supported versions
 
-LanTally has no released version yet. This policy becomes operational with the first pre-release.
+| Version | Supported |
+| --- | --- |
+| v0.1.x | Yes, once the first `v0.1.0` tag is published |
+| unreleased `*-dev` builds | Best-effort, no compatibility promise |
 
 ## Reporting a vulnerability
 

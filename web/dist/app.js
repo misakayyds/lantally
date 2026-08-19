@@ -4,6 +4,7 @@ const ROUTES = {
   devices: { title: "设备", eyebrow: "Traffic" },
   proxy: { title: "代理", eyebrow: "Proxy" },
   alerts: { title: "告警", eyebrow: "Alerts" },
+  settings: { title: "设置", eyebrow: "Settings" },
 };
 
 const EMPTY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>`;
@@ -27,9 +28,33 @@ const enrollSubmitBtn = document.getElementById("enroll-submit-btn");
 const enrollCancelBtn = document.getElementById("enroll-cancel-btn");
 const enrollOpenBtn = document.getElementById("enroll-open-btn");
 const copyTokenBtn = document.getElementById("copy-token-btn");
+const enrollLocal = document.getElementById("enroll-local");
+const enrollCommand = document.getElementById("enroll-command");
+const enrollWait = document.getElementById("enroll-wait");
+const enrollHint = document.getElementById("enroll-hint");
+const loginModeLabel = document.getElementById("login-mode-label");
+const setupConfirm = document.getElementById("setup-confirm");
+const loginSubmitBtn = document.getElementById("login-submit-btn");
+const loginPassword2 = document.getElementById("login-password2");
+
+const RANGE_HOURS = { "24h": 24, "72h": 72, "7d": 168, "30d": 720 };
+const RANGE_TITLES = {
+  "24h": "最近24小时流量使用情况",
+  "72h": "最近72小时流量使用情况",
+  "7d": "最近7天流量使用情况",
+  "30d": "最近30天流量使用情况",
+};
 
 let currentRoute = "overview";
+let currentDeviceId = "";
+let uiState = { range: "72h", group: "node" };
 let refreshTimer = null;
+let writingHash = false;
+let setupNeeded = false;
+let claimWaitTimer = null;
+let claimCommands = { linux: "", macos: "", windows: "" };
+let claimPlatform = "linux";
+let claimNodeId = "";
 
 function showToast(message) {
   toast.textContent = message;
@@ -56,9 +81,70 @@ function setScreen(loggedIn) {
   appShell.setAttribute("aria-hidden", loggedIn ? "false" : "true");
 }
 
-function setRoute(route) {
+function parseHash() {
+  const raw = (location.hash || "#overview").replace(/^#/, "") || "overview";
+  const [pathPart, queryPart] = raw.split("?");
+  const parts = (pathPart || "overview").split("/").filter(Boolean);
+  const params = new URLSearchParams(queryPart || "");
+  const range = params.get("range");
+  const group = params.get("group");
+  if (RANGE_HOURS[range]) uiState.range = range;
+  if (["node", "device", "class", "outbound"].includes(group)) uiState.group = group;
+  return { route: parts[0] || "overview", id: parts[1] || "" };
+}
+
+function writeHash(route, id) {
+  const params = new URLSearchParams();
+  params.set("range", uiState.range);
+  params.set("group", uiState.group);
+  const path = id ? `${route}/${encodeURIComponent(id)}` : route;
+  const next = `#${path}?${params.toString()}`;
+  if (location.hash === next) return;
+  writingHash = true;
+  location.hash = next;
+  writingHash = false;
+}
+
+function rangeWindow() {
+  const hours = RANGE_HOURS[uiState.range] || 72;
+  const to = new Date();
+  const from = new Date(to.getTime() - hours * 3600 * 1000);
+  return { from: from.toISOString(), to: to.toISOString() };
+}
+
+function trafficParams(extra = {}) {
+  const { from, to } = rangeWindow();
+  const params = new URLSearchParams({
+    from,
+    to,
+    group: extra.group || uiState.group,
+  });
+  if (extra.class) params.set("class", extra.class);
+  if (extra.node) params.set("node", extra.node);
+  if (extra.device) params.set("device", extra.device);
+  return params;
+}
+
+function syncToolbar() {
+  const toolbar = document.getElementById("chart-toolbar");
+  const groupChips = document.getElementById("group-chips");
+  const showToolbar =
+    ["overview", "nodes", "devices", "proxy"].includes(currentRoute) &&
+    !((currentRoute === "devices" || currentRoute === "nodes") && currentDeviceId);
+  toolbar.hidden = !showToolbar;
+  document.querySelectorAll("[data-range]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.range === uiState.range);
+  });
+  document.querySelectorAll("[data-group]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.group === uiState.group);
+  });
+  groupChips.hidden = currentRoute === "devices" && Boolean(currentDeviceId);
+}
+
+function setRoute(route, id = "") {
   if (!ROUTES[route]) route = "overview";
   currentRoute = route;
+  currentDeviceId = id;
 
   document.querySelectorAll(".nav-item").forEach((link) => {
     link.classList.toggle("active", link.dataset.route === route);
@@ -67,8 +153,10 @@ function setRoute(route) {
     view.classList.toggle("active", view.dataset.view === route);
   });
 
-  pageTitle.textContent = ROUTES[route].title;
+  pageTitle.textContent =
+    route === "devices" && id ? "设备详情" : route === "nodes" && id ? "节点详情" : ROUTES[route].title;
   pageEyebrow.textContent = ROUTES[route].eyebrow;
+  syncToolbar();
 }
 
 function formatBytes(value) {
@@ -81,8 +169,18 @@ function formatBytes(value) {
     v /= 1024;
     i += 1;
   } while (v >= 1024 && i < units.length - 1);
-  const digits = v >= 10 ? 1 : 2;
-  return `${v.toFixed(digits)} ${units[i]}`;
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatLastSeen(iso) {
+  if (!iso) return "等待上报";
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return "等待上报";
+  const sec = (Date.now() - t.getTime()) / 1000;
+  if (sec < 45) return "刚刚";
+  if (sec < 3600) return `${Math.max(1, Math.floor(sec / 60))} 分钟前`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+  return formatStamp(t);
 }
 
 const CHART_PALETTE = [
@@ -169,6 +267,7 @@ function axisUnit(maxBytes) {
 
 function renderTrafficChart(el, series, emptyHint) {
   if (!el) return;
+  const title = RANGE_TITLES[uiState.range] || RANGE_TITLES["72h"];
   const points = series?.points || [];
   const keys = [...(series?.keys || [])].sort((a, b) => {
     return Number((series.totals || {})[b] || 0) - Number((series.totals || {})[a] || 0);
@@ -269,10 +368,10 @@ function renderTrafficChart(el, series, emptyHint) {
       <div class="chart-panel">
         <div class="chart-head">
           <span class="chart-mark" aria-hidden="true"><span></span><span></span><span></span></span>
-          <h3 class="chart-title">最近72小时流量使用情况</h3>
+          <h3 class="chart-title">${escapeHtml(title)}</h3>
         </div>
         <div class="chart-plot">
-          <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="最近72小时流量使用情况">
+          <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(title)}">
             <text x="14" y="${pad.top + plotH / 2}" fill="#9aa3af" font-size="11" text-anchor="middle" transform="rotate(-90 14 ${pad.top + plotH / 2})">${unit.label}</text>
             ${grid.join("")}
             ${bars}
@@ -375,7 +474,7 @@ function renderNodes(data) {
   renderTrafficChart(
     document.getElementById("nodes-chart"),
     data.traffic,
-    "节点上报后，按节点堆叠显示最近 72 小时流量。"
+    "节点上报后，按节点堆叠显示所选时间范围。"
   );
 
   const wrap = document.getElementById("nodes-table-wrap");
@@ -386,22 +485,26 @@ function renderNodes(data) {
       <div class="empty">
         ${EMPTY_ICON}
         <h3>还没有节点</h3>
-        <p>注册节点并部署 agent 后，上报会出现在这里。</p>
+        <p>添加节点并在目标机器上执行安装命令后，上报会出现在这里。</p>
       </div>`;
     return;
   }
 
   wrap.innerHTML = `
     <table>
-      <thead><tr><th>节点</th><th>站点</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
+      <thead><tr><th>节点</th><th>站点</th><th>最后上报</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
       <tbody>
         ${nodes
           .map((node) => {
             const bytes = node.bytes || {};
+            const id = node.id || node.ID || "";
+            const seen = formatLastSeen(node.last_seen_at);
+            const waiting = !node.last_seen_at;
             return `
-          <tr>
-            <td>${escapeHtml(node.id || node.ID || "")}</td>
+          <tr class="row-link" data-node="${escapeHtml(id)}">
+            <td>${escapeHtml(id)}</td>
             <td>${escapeHtml(node.site_id || node.SiteID || "")}</td>
+            <td class="${waiting ? "status-muted" : ""}">${escapeHtml(seen)}</td>
             <td>${formatBytes(bytes.total)}</td>
             <td>${formatBytes(bytes.direct)}</td>
             <td>${formatBytes(bytes.proxy_raw)}</td>
@@ -410,6 +513,65 @@ function renderNodes(data) {
           .join("")}
       </tbody>
     </table>`;
+  wrap.querySelectorAll("[data-node]").forEach((row) => {
+    row.addEventListener("click", () => writeHash("nodes", row.dataset.node));
+  });
+}
+
+function renderNodeDetail(node) {
+  const bytes = node.bytes || {};
+  const id = node.id || "";
+  const seen = formatLastSeen(node.last_seen_at);
+  document.getElementById("nodes-chart").innerHTML = "";
+  document.getElementById("nodes-table-wrap").innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>${escapeHtml(id)}</h3>
+          <p class="card-sub">站点 ${escapeHtml(node.site_id || "")} · ${escapeHtml(seen)}</p>
+        </div>
+        <button type="button" class="btn btn-text" id="node-back-btn">返回列表</button>
+      </div>
+      <div class="metrics">
+        <article class="metric">
+          <div class="metric-label">总量</div>
+          <div class="metric-value">${formatBytes(bytes.total)}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">直连</div>
+          <div class="metric-value">${formatBytes(bytes.direct)}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">代理</div>
+          <div class="metric-value">${formatBytes(bytes.proxy_raw)}</div>
+        </article>
+      </div>
+      <div class="device-actions">
+        <button type="button" id="node-reissue-btn" class="btn btn-secondary btn-sm">重新发放领取码</button>
+        <button type="button" id="node-revoke-btn" class="btn btn-secondary btn-sm">撤销节点</button>
+      </div>
+      <p class="note">${node.last_seen_at ? "已收到上报。" : "还没有第一包。把安装命令在目标机器上跑一次即可。"}</p>
+    </div>`;
+  document.getElementById("node-back-btn").addEventListener("click", () => writeHash("nodes"));
+  document.getElementById("node-reissue-btn").addEventListener("click", () => {
+    document.getElementById("enroll-site").value = node.site_id || "home";
+    document.getElementById("enroll-node").value = id;
+    resetEnrollDialog();
+    enrollDialog.showModal();
+  });
+  document.getElementById("node-revoke-btn").addEventListener("click", async () => {
+    if (!window.confirm(`撤销节点 ${id}？该节点的 token 立刻失效。`)) return;
+    const response = await api(`/v1/nodes/${encodeURIComponent(id)}/revoke`, {
+      method: "POST",
+      body: "{}",
+    });
+    if (!response.ok) {
+      showToast("撤销失败");
+      return;
+    }
+    showToast("节点已撤销");
+    writeHash("nodes");
+  });
 }
 
 function renderEmptyCard(containerId, title, description) {
@@ -430,22 +592,25 @@ function renderDevices(data) {
     return;
   }
   document.getElementById("devices-content").innerHTML = `
+    <div id="devices-chart"></div>
     <div class="card">
       <div class="card-header">
         <div>
           <h3>设备</h3>
-          <p class="card-sub">neigh 观察只用于识别，不计入总量</p>
+          <p class="card-sub">点进设备可改名、合并，并查看直连/代理曲线</p>
         </div>
       </div>
       <table>
-        <thead><tr><th>设备</th><th>站点</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
+        <thead><tr><th>设备</th><th>地址</th><th>总量</th><th>直连</th><th>代理</th></tr></thead>
         <tbody>
           ${devices
             .map((device) => {
               const bytes = device.bytes || {};
-              return `<tr>
-                <td>${escapeHtml(device.id || "")}</td>
-                <td>${escapeHtml(device.site_id || "")}</td>
+              const label = device.name || device.id || "";
+              const addr = [device.ip, device.mac].filter(Boolean).join(" / ") || "—";
+              return `<tr class="row-link" data-device="${escapeHtml(device.id || "")}">
+                <td>${escapeHtml(label)}</td>
+                <td>${escapeHtml(addr)}</td>
                 <td>${formatBytes(bytes.total)}</td>
                 <td>${formatBytes(bytes.direct)}</td>
                 <td>${formatBytes(bytes.proxy_raw)}</td>
@@ -455,10 +620,129 @@ function renderDevices(data) {
         </tbody>
       </table>
     </div>`;
+  renderTrafficChart(
+    document.getElementById("devices-chart"),
+    data.traffic,
+    "有设备流量后，这里按设备堆叠显示所选时间范围。"
+  );
+  document.querySelectorAll("#devices-content [data-device]").forEach((row) => {
+    row.addEventListener("click", () => {
+      writeHash("devices", row.dataset.device);
+    });
+  });
+}
+
+function renderDeviceDetail(detail, traffic) {
+  const device = detail.device || {};
+  const merged = detail.merged_from || [];
+  const bytes = device.bytes || {};
+  const label = device.name || device.id || "";
+  document.getElementById("devices-content").innerHTML = `
+    <p><a class="back-link" href="#devices">← 返回设备列表</a></p>
+    <div class="metrics">
+      <article class="metric">
+        <div class="metric-label">总量</div>
+        <div class="metric-value">${formatBytes(bytes.total)}</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">直连</div>
+        <div class="metric-value">${formatBytes(bytes.direct)}</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">代理</div>
+        <div class="metric-value">${formatBytes(bytes.proxy_raw)}</div>
+      </article>
+    </div>
+    <div id="device-chart"></div>
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>${escapeHtml(label)}</h3>
+          <p class="card-sub">${escapeHtml([device.ip, device.mac, device.id].filter(Boolean).join(" · "))}</p>
+        </div>
+      </div>
+      <div class="device-actions">
+        <div class="field">
+          <label for="device-name">备注名</label>
+          <input id="device-name" value="${escapeHtml(device.name || "")}" placeholder="例如 书房电脑" />
+        </div>
+        <button type="button" id="device-rename-btn" class="btn btn-primary btn-sm">保存名称</button>
+      </div>
+      <div class="device-actions">
+        <div class="field">
+          <label for="device-merge-id">合并到当前设备</label>
+          <input id="device-merge-id" placeholder="另一个设备 ID" />
+        </div>
+        <button type="button" id="device-merge-btn" class="btn btn-secondary btn-sm">合并</button>
+        <button type="button" id="device-unmerge-btn" class="btn btn-text btn-sm">拆分最近一次合并</button>
+      </div>
+      ${merged.length ? `<p class="note">已合并：${escapeHtml(merged.join("、"))}</p>` : `<p class="note">合并只改身份归属，不会重算历史字节。</p>`}
+    </div>`;
+  renderTrafficChart(
+    document.getElementById("device-chart"),
+    traffic,
+    "该设备还没有时间曲线。新上报后会出现直连/代理柱。"
+  );
+  document.getElementById("device-rename-btn").addEventListener("click", async () => {
+    const name = document.getElementById("device-name").value.trim();
+    const response = await api(`/v1/devices/${encodeURIComponent(device.id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ name }),
+    });
+    if (!response.ok) {
+      showToast("改名失败");
+      return;
+    }
+    showToast("已保存名称");
+    await loadView("devices", device.id);
+  });
+  document.getElementById("device-merge-btn").addEventListener("click", async () => {
+    const other_id = document.getElementById("device-merge-id").value.trim();
+    if (!other_id) return;
+    const response = await api(`/v1/devices/${encodeURIComponent(device.id)}/merge`, {
+      method: "POST",
+      body: JSON.stringify({ other_id, reason: "manual" }),
+    });
+    if (!response.ok) {
+      showToast("合并失败");
+      return;
+    }
+    showToast("已合并");
+    await loadView("devices", device.id);
+  });
+  document.getElementById("device-unmerge-btn").addEventListener("click", async () => {
+    const response = await api(`/v1/devices/${encodeURIComponent(device.id)}/unmerge`, {
+      method: "POST",
+      body: "{}",
+    });
+    if (!response.ok) {
+      showToast("拆分失败");
+      return;
+    }
+    showToast("已拆分");
+    await loadView("devices", device.id);
+  });
 }
 
 function renderProxy(data) {
   const proxy = data.proxy || {};
+  const outbounds = data.outbounds || [];
+  const rows = outbounds
+    .map((row) => {
+      const share = Number(row.share || 0) * 100;
+      const badge = row.configured ? "" : `<span class="badge">未折算</span>`;
+      const factor = row.configured ? String(row.factor) : "";
+      return `<tr>
+        <td>${escapeHtml(row.name || "")} ${badge}</td>
+        <td>${formatBytes(row.raw)}</td>
+        <td>
+          <input class="factor-input" data-outbound="${escapeHtml(row.name || "")}" inputmode="decimal" placeholder="x1.5" value="${escapeHtml(factor)}" />
+        </td>
+        <td>${formatBytes(row.adjusted)}</td>
+        <td>${share.toFixed(1)}%</td>
+      </tr>`;
+    })
+    .join("");
   document.getElementById("proxy-content").innerHTML = `
     <div id="proxy-chart"></div>
     <div class="metrics">
@@ -478,16 +762,296 @@ function renderProxy(data) {
         <div class="metric-label">未调倍率</div>
         <div class="metric-value">${formatBytes(proxy.proxy_unadjusted)}</div>
       </article>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>出口节点</h3>
+          <p class="card-sub">行内填写倍率后立即保存；只影响之后入账</p>
+        </div>
+      </div>
+      ${
+        outbounds.length
+          ? `<table>
+        <thead><tr><th>出口</th><th>原始</th><th>倍率</th><th>折算</th><th>占比</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p class="note">倍率不会回溯重算已经入账的历史。未配置的出口保持「未折算」。</p>`
+          : `<div class="empty"><h3>还没有出口流量</h3><p>接入 Mihomo 后，这里按 outbound 列出用量和倍率。</p></div>`
+      }
     </div>`;
   renderTrafficChart(
     document.getElementById("proxy-chart"),
     data.traffic,
-    "接入 Mihomo 后，这里按直连和代理堆叠显示。"
+    "接入 Mihomo 后，这里按出口节点堆叠显示。"
   );
+  document.querySelectorAll(".factor-input").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const factor = Number(input.value);
+      if (!(factor > 0)) {
+        showToast("倍率必须大于 0");
+        return;
+      }
+      const response = await api("/v1/proxy/multipliers", {
+        method: "PUT",
+        body: JSON.stringify({ name: input.dataset.outbound, factor }),
+      });
+      if (!response.ok) {
+        showToast("保存倍率失败");
+        return;
+      }
+      showToast("已保存倍率，后续入账生效");
+    });
+  });
+
+  const billing = data.billing || {};
+  const ratioPct = Number(billing.ratio || 0) * 100;
+  document.getElementById("proxy-content").insertAdjacentHTML(
+    "beforeend",
+    `<div class="card">
+      <div class="card-header">
+        <div>
+          <h3>本月账单对照</h3>
+          <p class="card-sub">手填服务商已用量和重置日，对照本地折算用量。偏差超过 10% 会告警。</p>
+        </div>
+      </div>
+      <div class="metrics">
+        <article class="metric">
+          <div class="metric-label">本地折算</div>
+          <div class="metric-value">${formatBytes(billing.local_bytes)}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">服务商计数</div>
+          <div class="metric-value">${formatBytes(billing.provider_bytes)}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">差值</div>
+          <div class="metric-value">${formatBytes(Math.abs(Number(billing.delta || 0)))}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">差率</div>
+          <div class="metric-value">${ratioPct.toFixed(1)}%</div>
+        </article>
+      </div>
+      <div class="device-actions">
+        <div class="field">
+          <label for="billing-reset-day">重置日（每月 1–28）</label>
+          <input id="billing-reset-day" type="number" min="1" max="28" value="${escapeHtml(String(billing.reset_day || 1))}" />
+        </div>
+        <div class="field">
+          <label for="billing-provider">服务商已用量（字节）</label>
+          <input id="billing-provider" inputmode="numeric" value="${escapeHtml(String(billing.provider_bytes || 0))}" />
+        </div>
+        <button type="button" id="billing-save-btn" class="btn btn-primary btn-sm">保存对照</button>
+      </div>
+      <p class="note">对照窗口从最近一次重置日到现在。保存后只影响告警，不会改账本历史。</p>
+    </div>`
+  );
+  document.getElementById("billing-save-btn").addEventListener("click", async () => {
+    const reset_day = Number(document.getElementById("billing-reset-day").value);
+    const provider_bytes = Number(document.getElementById("billing-provider").value);
+    const response = await api("/v1/proxy/billing", {
+      method: "PUT",
+      body: JSON.stringify({ reset_day, provider_bytes }),
+    });
+    if (!response.ok) {
+      showToast("保存对账失败");
+      return;
+    }
+    showToast("已更新账单对照");
+    await loadView("proxy");
+  });
 }
 
-async function loadView(route) {
-  const response = await api(`/v1/${route}`);
+const ALERT_LABELS = {
+  silence: "节点静默",
+  growth: "用量突增",
+  reset: "计数器重置",
+  drift: "对账偏差",
+};
+
+function renderAlerts(data) {
+  const alerts = data.alerts ?? [];
+  if (alerts.length === 0) {
+    renderEmptyCard("alerts-content", "暂无告警", "节点停报、重置频繁或对账偏差过大时会在这里提示。");
+    return;
+  }
+  document.getElementById("alerts-content").innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>待处理告警</h3>
+          <p class="card-sub">确认后同一事件不再重复提示，恢复后如再次发生会重新告警</p>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>类型</th><th>对象</th><th>说明</th><th>时间</th><th></th></tr></thead>
+        <tbody>
+          ${alerts
+            .map((item) => {
+              const when = item.observed_at ? formatStamp(new Date(item.observed_at)) : "";
+              return `<tr>
+                <td>${escapeHtml(ALERT_LABELS[item.kind] || item.kind || "")}</td>
+                <td>${escapeHtml(item.node_id || item.device_id || "全局")}</td>
+                <td>${escapeHtml(item.message || "")}</td>
+                <td>${escapeHtml(when)}</td>
+                <td><button type="button" class="btn btn-secondary btn-sm" data-ack="${item.id}">确认</button></td>
+              </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>`;
+  document.querySelectorAll("[data-ack]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const response = await api(`/v1/alerts/${btn.dataset.ack}/ack`, {
+        method: "POST",
+        body: "{}",
+      });
+      if (!response.ok) {
+        showToast("确认失败");
+        return;
+      }
+      showToast("已确认");
+      await loadView("alerts");
+    });
+  });
+}
+
+function renderSettings(data) {
+  const retention = data.retention || {};
+  const samplesDays = retention.samples_days || 14;
+  const daily = retention.daily || "permanent";
+  document.getElementById("settings-content").innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>管理员密码</h3>
+          <p class="card-sub">修改后当前会话仍然有效</p>
+        </div>
+      </div>
+      <div class="device-actions">
+        <div class="field">
+          <label for="settings-current">当前密码</label>
+          <input id="settings-current" type="password" autocomplete="current-password" />
+        </div>
+        <div class="field">
+          <label for="settings-new">新密码（至少 8 位）</label>
+          <input id="settings-new" type="password" autocomplete="new-password" minlength="8" />
+        </div>
+        <button type="button" id="settings-password-btn" class="btn btn-primary btn-sm">保存密码</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>备份</h3>
+          <p class="card-sub">下载当前 SQLite。升级前 server 也会在迁移时自动复制一份 bak 文件。</p>
+        </div>
+        <button type="button" id="settings-backup-btn" class="btn btn-secondary btn-sm">下载 lantally.db</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>数据保留与协议</h3>
+          <p class="card-sub">公开部署必须放在 HTTPS 反代后面。</p>
+        </div>
+      </div>
+      <div class="metrics">
+        <article class="metric">
+          <div class="metric-label">明细采样</div>
+          <div class="metric-value">${escapeHtml(String(samplesDays))} 天</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">日聚合</div>
+          <div class="metric-value">${escapeHtml(daily === "permanent" ? "永久" : String(daily))}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">协议版本</div>
+          <div class="metric-value">${escapeHtml(String(data.protocol_version || 1))}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">软件版本</div>
+          <div class="metric-value">${escapeHtml(String(data.app_version || ""))}</div>
+        </article>
+      </div>
+      <p class="note">v0.1 冻结 protocol_version=1。旧 agent 可继续上报；未知版本会被拒绝并返回明确错误。升级失败时用数据目录里的 lantally.db.bak-&lt;unix&gt; 覆盖后重启。</p>
+    </div>`;
+  document.getElementById("settings-password-btn").addEventListener("click", async () => {
+    const current = document.getElementById("settings-current").value;
+    const password = document.getElementById("settings-new").value;
+    if (password.length < 8) {
+      showToast("新密码至少 8 位");
+      return;
+    }
+    const response = await api("/v1/settings/password", {
+      method: "PUT",
+      body: JSON.stringify({ current, password }),
+    });
+    if (!response.ok) {
+      showToast(response.status === 401 ? "当前密码不正确" : "修改失败");
+      return;
+    }
+    document.getElementById("settings-current").value = "";
+    document.getElementById("settings-new").value = "";
+    showToast("密码已更新");
+  });
+  document.getElementById("settings-backup-btn").addEventListener("click", async () => {
+    const response = await fetch("/v1/backup", { credentials: "same-origin" });
+    if (!response.ok) {
+      showToast("备份失败");
+      return;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "lantally.db";
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("已开始下载备份");
+  });
+}
+
+async function loadView(route, id = "") {
+  if (route === "nodes" && id) {
+    const detailRes = await api(`/v1/nodes/${encodeURIComponent(id)}`);
+    if (detailRes.status === 401) {
+      setScreen(false);
+      stopAutoRefresh();
+      return false;
+    }
+    if (!detailRes.ok) {
+      showToast("加载节点失败");
+      return true;
+    }
+    renderNodeDetail(await detailRes.json());
+    return true;
+  }
+  if (route === "devices" && id) {
+    const detailRes = await api(`/v1/devices/${encodeURIComponent(id)}`);
+    if (detailRes.status === 401) {
+      setScreen(false);
+      stopAutoRefresh();
+      return false;
+    }
+    if (!detailRes.ok) {
+      showToast("加载设备失败");
+      return true;
+    }
+    const trafficRes = await api(`/v1/traffic?${trafficParams({ group: "class", device: id }).toString()}`);
+    const detail = await detailRes.json();
+    const traffic = trafficRes.ok ? await trafficRes.json() : { keys: [], points: [], totals: {} };
+    renderDeviceDetail(detail, traffic);
+    return true;
+  }
+
+  const query = trafficParams({
+    group: route === "proxy" ? "outbound" : uiState.group,
+    class: route === "proxy" ? "proxy_raw" : "",
+  });
+  const response = await api(`/v1/${route}?${query.toString()}`);
   if (response.status === 401) {
     setScreen(false);
     stopAutoRefresh();
@@ -506,20 +1070,27 @@ async function loadView(route) {
       renderNodes(data);
       break;
     case "devices":
+      {
+        const trafficRes = await api(`/v1/traffic?${trafficParams({ group: "device", class: "total" }).toString()}`);
+        if (trafficRes.ok) data.traffic = await trafficRes.json();
+      }
       renderDevices(data);
       break;
     case "proxy":
       renderProxy(data);
       break;
     case "alerts":
-      renderEmptyCard("alerts-content", "暂无告警", "节点离线或偏差过大时会在这里提示。");
+      renderAlerts(data);
+      break;
+    case "settings":
+      renderSettings(data);
       break;
   }
   return true;
 }
 
 async function refreshCurrent() {
-  await loadView(currentRoute);
+  await loadView(currentRoute, currentDeviceId);
   if (currentRoute !== "overview") await loadView("overview");
 }
 
@@ -543,30 +1114,134 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function applyAuthMode() {
+  loginModeLabel.textContent = setupNeeded ? "首次设置" : "登录控制台";
+  setupConfirm.classList.toggle("hidden", !setupNeeded);
+  loginPassword2.required = setupNeeded;
+  loginSubmitBtn.textContent = setupNeeded ? "完成设置" : "进入";
+  document.getElementById("login-password").autocomplete = setupNeeded
+    ? "new-password"
+    : "current-password";
+}
+
+function stopClaimWait() {
+  if (claimWaitTimer) {
+    clearInterval(claimWaitTimer);
+    claimWaitTimer = null;
+  }
+}
+
+function showClaimCommand() {
+  enrollCommand.textContent = claimCommands[claimPlatform] || "";
+  document.querySelectorAll("[data-platform]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.platform === claimPlatform);
+  });
+}
+
+async function pollClaimNode() {
+  if (!claimNodeId) return;
+  const response = await api(`/v1/nodes/${encodeURIComponent(claimNodeId)}`);
+  if (response.status === 404) {
+    enrollWait.textContent = "等待领取码被兑换…";
+    enrollWait.classList.remove("ok");
+    return;
+  }
+  if (!response.ok) return;
+  const node = await response.json();
+  if (node.last_seen_at) {
+    enrollWait.textContent = "已收到第一包 ✓";
+    enrollWait.classList.add("ok");
+    stopClaimWait();
+    await loadView("nodes");
+    return;
+  }
+  enrollWait.textContent = "领取码已兑换，等待第一包上报…";
+  enrollWait.classList.remove("ok");
+}
+
+function startClaimWait(nodeId) {
+  claimNodeId = nodeId;
+  stopClaimWait();
+  pollClaimNode();
+  claimWaitTimer = setInterval(pollClaimNode, 2000);
+}
+
 function resetEnrollDialog() {
   enrollError.classList.add("hidden");
   enrollResult.classList.add("hidden");
   enrollToken.textContent = "";
-  enrollSubmitBtn.textContent = "生成 Token";
+  enrollCommand.textContent = "";
+  enrollHint.textContent = "";
+  enrollWait.textContent = "等待第一包上报…";
+  enrollWait.classList.remove("ok");
+  enrollSubmitBtn.textContent = "生成安装命令";
   enrollSubmitBtn.disabled = false;
+  claimCommands = { linux: "", macos: "", windows: "" };
+  claimPlatform = "linux";
+  stopClaimWait();
 }
 
 async function bootstrap() {
+  try {
+    const setupRes = await fetch("/v1/setup", { credentials: "same-origin" });
+    if (setupRes.ok) {
+      setupNeeded = Boolean((await setupRes.json()).needed);
+    }
+  } catch {
+    setupNeeded = false;
+  }
+  applyAuthMode();
+  if (setupNeeded) {
+    setScreen(false);
+    return;
+  }
+  const parsed = parseHash();
   const ok = await loadView("overview");
   if (!ok) {
     setScreen(false);
     return;
   }
   setScreen(true);
-  setRoute(location.hash.replace("#", "") || "overview");
-  await loadView(currentRoute);
+  setRoute(parsed.route, parsed.id);
+  await loadView(currentRoute, currentDeviceId);
   startAutoRefresh();
 }
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   loginError.classList.add("hidden");
-  const password = new FormData(loginForm).get("password");
+  const password = String(new FormData(loginForm).get("password") || "");
+  if (setupNeeded) {
+    const again = String(loginPassword2.value || "");
+    if (password.length < 8) {
+      loginError.textContent = "密码至少 8 位";
+      loginError.classList.remove("hidden");
+      return;
+    }
+    if (password !== again) {
+      loginError.textContent = "两次输入的密码不一致";
+      loginError.classList.remove("hidden");
+      return;
+    }
+    const response = await api("/v1/setup", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
+    if (!response.ok) {
+      loginError.textContent = response.status === 409 ? "已经设置过管理员" : "设置失败";
+      loginError.classList.remove("hidden");
+      return;
+    }
+    setupNeeded = false;
+    applyAuthMode();
+    loginForm.reset();
+    setScreen(true);
+    setRoute("overview");
+    writeHash("overview");
+    await refreshCurrent();
+    startAutoRefresh();
+    return;
+  }
   const response = await api("/v1/login", {
     method: "POST",
     body: JSON.stringify({ password }),
@@ -579,6 +1254,7 @@ loginForm.addEventListener("submit", async (event) => {
   loginForm.reset();
   setScreen(true);
   setRoute("overview");
+  writeHash("overview");
   await refreshCurrent();
   startAutoRefresh();
 });
@@ -586,6 +1262,7 @@ loginForm.addEventListener("submit", async (event) => {
 logoutBtn.addEventListener("click", async () => {
   await api("/v1/logout", { method: "POST", body: "{}" });
   stopAutoRefresh();
+  stopClaimWait();
   setScreen(false);
   location.hash = "";
 });
@@ -593,8 +1270,27 @@ logoutBtn.addEventListener("click", async () => {
 refreshBtn.addEventListener("click", () => refreshCurrent());
 
 window.addEventListener("hashchange", async () => {
-  setRoute(location.hash.replace("#", "") || "overview");
-  await loadView(currentRoute);
+  if (writingHash) return;
+  const parsed = parseHash();
+  setRoute(parsed.route, parsed.id);
+  await loadView(currentRoute, currentDeviceId);
+});
+
+document.getElementById("chart-toolbar").addEventListener("click", async (event) => {
+  const btn = event.target.closest("[data-range],[data-group]");
+  if (!btn) return;
+  if (btn.dataset.range) uiState.range = btn.dataset.range;
+  if (btn.dataset.group) uiState.group = btn.dataset.group;
+  writeHash(currentRoute, currentDeviceId);
+  syncToolbar();
+  await loadView(currentRoute, currentDeviceId);
+});
+
+document.querySelectorAll(".nav-item").forEach((link) => {
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    writeHash(link.dataset.route);
+  });
 });
 
 enrollOpenBtn.addEventListener("click", () => {
@@ -612,38 +1308,54 @@ enrollForm.addEventListener("submit", async (event) => {
   const formData = new FormData(enrollForm);
   const site_id = String(formData.get("site_id") || "").trim();
   const node_id = String(formData.get("node_id") || "").trim();
+  const local = Boolean(enrollLocal.checked);
   if (!site_id || !node_id) return;
 
-  const response = await api("/v1/enroll", {
+  const response = await api("/v1/claims", {
     method: "POST",
-    body: JSON.stringify({ site_id, node_id }),
+    body: JSON.stringify({ site_id, node_id, local }),
   });
 
   if (!response.ok) {
-    enrollError.textContent =
-      response.status === 409 ? "节点 ID 已存在" : "注册失败";
+    enrollError.textContent = "生成领取码失败";
     enrollError.classList.remove("hidden");
     return;
   }
 
   const data = await response.json();
-  enrollToken.textContent = data.token || "";
+  enrollToken.textContent = data.code || "";
+  claimCommands = {
+    linux: data.linux || "",
+    macos: data.macos || "",
+    windows: data.windows || "",
+  };
+  enrollHint.textContent = data.mihomo_hint || (local ? "" : "安装脚本会只读探测本机 Mihomo，密钥不会上传。");
   enrollResult.classList.remove("hidden");
   enrollSubmitBtn.textContent = "已生成";
   enrollSubmitBtn.disabled = true;
+  showClaimCommand();
+  startClaimWait(node_id);
   await loadView("nodes");
-  showToast("节点已注册");
+  showToast("领取码已生成");
 });
 
 copyTokenBtn.addEventListener("click", async () => {
-  const token = enrollToken.textContent;
-  if (!token) return;
+  const text = enrollCommand.textContent || enrollToken.textContent;
+  if (!text) return;
   try {
-    await navigator.clipboard.writeText(token);
+    await navigator.clipboard.writeText(text);
     showToast("已复制");
   } catch {
     showToast("请手动复制");
   }
+});
+
+document.querySelector(".install-platforms").addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-platform]");
+  if (!btn) return;
+  event.preventDefault();
+  claimPlatform = btn.dataset.platform;
+  showClaimCommand();
 });
 
 bootstrap();

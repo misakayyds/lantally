@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/misakayyds/lantally/internal/enroll"
@@ -28,18 +30,36 @@ type Store struct {
 	databasePath string
 }
 
+const schemaVersion = 11
+
 type Node struct {
-	ID     string `json:"id"`
-	SiteID string `json:"site_id"`
+	ID         string `json:"id"`
+	SiteID     string `json:"site_id"`
+	LastSeenAt string `json:"last_seen_at,omitempty"`
+	LastBootID string `json:"last_boot_id,omitempty"`
 }
 
 type DeviceLedger struct {
 	ID     string            `json:"id"`
 	SiteID string            `json:"site_id"`
+	Name   string            `json:"name"`
+	IP     string            `json:"ip,omitempty"`
+	MAC    string            `json:"mac,omitempty"`
 	Bytes  map[string]uint64 `json:"bytes"`
 }
 
+type OutboundLedger struct {
+	Name       string  `json:"name"`
+	Raw        uint64  `json:"raw"`
+	Factor     float64 `json:"factor"`
+	Adjusted   uint64  `json:"adjusted"`
+	Unadjusted uint64  `json:"unadjusted"`
+	Configured bool    `json:"configured"`
+	Share      float64 `json:"share"`
+}
+
 func Open(dsn string) (*Store, error) {
+	existing := fileDSNSize(dsn) > 0
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -50,11 +70,45 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if existing {
+		version, err := sqliteUserVersion(db)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if version < schemaVersion {
+			if _, err := store.Backup(); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+		}
+	}
 	if err := applyMigrations(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func fileDSNSize(dsn string) int64 {
+	if dsn == "" || dsn == ":memory:" || strings.Contains(dsn, "mode=memory") {
+		return 0
+	}
+	info, err := os.Stat(dsn)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func sqliteUserVersion(db *sql.DB) (int, error) {
+	var version int
+	err := db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	return version, err
 }
 
 // applyMigrations applies the numbered schema steps needed by both new and
@@ -118,7 +172,84 @@ func applyMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(string(sampleMigration))
+	if _, err := db.Exec(string(sampleMigration)); err != nil {
+		return err
+	}
+
+	hasOutbound, err := tableHasColumn(db, "ledger_totals", "outbound")
+	if err != nil {
+		return err
+	}
+	if !hasOutbound {
+		outboundMigration, err := migrations.ReadFile("migrations/0007_ledger_outbound.sql")
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(string(outboundMigration)); err != nil {
+			return err
+		}
+	}
+
+	dailyMigration, err := migrations.ReadFile("migrations/0008_ledger_daily.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(dailyMigration)); err != nil {
+		return err
+	}
+
+	multipliersMigration, err := migrations.ReadFile("migrations/0009_multipliers_devices.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(multipliersMigration)); err != nil {
+		return err
+	}
+	hasDisplayName, err := tableHasColumn(db, "devices", "display_name")
+	if err != nil {
+		return err
+	}
+	if !hasDisplayName {
+		if _, err := db.Exec(`ALTER TABLE devices ADD COLUMN display_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+
+	alertsMigration, err := migrations.ReadFile("migrations/0010_alerts_billing.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(alertsMigration)); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "last_seen_at", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "last_interval_ms", `INTEGER NOT NULL DEFAULT 15000`); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "last_boot_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	claimsMigration, err := migrations.ReadFile("migrations/0011_claim_codes.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(claimsMigration)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func addNodeColumn(db *sql.DB, name, decl string) error {
+	has, err := tableHasColumn(db, "nodes", name)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE nodes ADD COLUMN ` + name + ` ` + decl)
 	return err
 }
 
@@ -156,6 +287,8 @@ func tableHasColumn(db *sql.DB, table, column string) (bool, error) {
 }
 
 func (s *Store) Close() error {
+	// Drop idle connections so Windows can unlink the TempDir database.
+	s.db.SetMaxIdleConns(0)
 	return s.db.Close()
 }
 
@@ -180,7 +313,7 @@ func (s *Store) CreateNode(
 }
 
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id FROM nodes WHERE revoked = 0 ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id, last_seen_at, last_boot_id FROM nodes WHERE revoked = 0 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -189,12 +322,25 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	var nodes []Node
 	for rows.Next() {
 		var node Node
-		if err := rows.Scan(&node.ID, &node.SiteID); err != nil {
+		if err := rows.Scan(&node.ID, &node.SiteID, &node.LastSeenAt, &node.LastBootID); err != nil {
 			return nil, err
 		}
 		nodes = append(nodes, node)
 	}
 	return nodes, rows.Err()
+}
+
+func (s *Store) GetNode(ctx context.Context, id string) (Node, error) {
+	var node Node
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, site_id, last_seen_at, last_boot_id FROM nodes WHERE id = ? AND revoked = 0`,
+		id,
+	).Scan(&node.ID, &node.SiteID, &node.LastSeenAt, &node.LastBootID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Node{}, err
+	}
+	return node, err
 }
 
 func (s *Store) RevokeNode(ctx context.Context, id string) error {

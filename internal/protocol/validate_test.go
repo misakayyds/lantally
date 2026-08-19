@@ -21,10 +21,14 @@ func validBatch() Batch {
 
 func TestValidateRejectsWrongVersion(t *testing.T) {
 	b := validBatch()
-	b.ProtocolVersion = 0
+	b.ProtocolVersion = 2
 	err := Validate(b)
-	if !errors.Is(err, errProtocolVersion) {
-		t.Fatalf("expected version error, got %v", err)
+	var ver VersionError
+	if !errors.As(err, &ver) || ver.Got != 2 || ver.Want != 1 {
+		t.Fatalf("expected VersionError got=2 want=1, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "protocol_version 2") {
+		t.Fatalf("error should name the version: %v", err)
 	}
 }
 

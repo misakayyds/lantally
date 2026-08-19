@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/misakayyds/lantally/internal/accounting"
@@ -63,14 +64,15 @@ func (s *Store) ApplyLedgerOnce(
 		}
 		_, err = tx.ExecContext(
 			ctx,
-			`INSERT INTO ledger_totals (site_id, node_id, device_id, class, rx, tx)
-			 VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(site_id, node_id, device_id, class)
+			`INSERT INTO ledger_totals (site_id, node_id, device_id, class, outbound, rx, tx)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(site_id, node_id, device_id, class, outbound)
 			 DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx`,
 			siteID,
 			nodeID,
 			item.DeviceID,
 			item.Class,
+			item.Outbound,
 			int64(item.Rx),
 			int64(item.Tx),
 		)
@@ -79,13 +81,14 @@ func (s *Store) ApplyLedgerOnce(
 		}
 		_, err = tx.ExecContext(
 			ctx,
-			`INSERT INTO ledger_samples (sampled_at, site_id, node_id, device_id, class, rx, tx)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO ledger_samples (sampled_at, site_id, node_id, device_id, class, outbound, rx, tx)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			sampledUnix,
 			siteID,
 			nodeID,
 			item.DeviceID,
 			item.Class,
+			item.Outbound,
 			int64(item.Rx),
 			int64(item.Tx),
 		)
@@ -117,9 +120,10 @@ func (s *Store) LedgerTotals(ctx context.Context) (map[string]uint64, error) {
 func (s *Store) NodeLedgerTotals(ctx context.Context, siteID, nodeID string) (map[string]uint64, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT class, rx + tx
+		`SELECT class, SUM(rx) + SUM(tx)
 		 FROM ledger_totals
-		 WHERE site_id = ? AND node_id = ? AND device_id = ''`,
+		 WHERE site_id = ? AND node_id = ? AND device_id = ''
+		 GROUP BY class`,
 		siteID,
 		nodeID,
 	)
@@ -133,7 +137,7 @@ func (s *Store) NodeLedgerTotals(ctx context.Context, siteID, nodeID string) (ma
 func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT d.id, d.site_id, IFNULL(t.class, ''), IFNULL(t.rx, 0), IFNULL(t.tx, 0)
+		`SELECT d.id, d.site_id, IFNULL(d.display_name, ''), IFNULL(t.class, ''), IFNULL(t.rx, 0), IFNULL(t.tx, 0)
 		 FROM devices d
 		 LEFT JOIN ledger_totals t
 		   ON t.device_id = d.id AND t.site_id = d.site_id
@@ -148,9 +152,9 @@ func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 	index := map[string]int{}
 	var devices []DeviceLedger
 	for rows.Next() {
-		var id, siteID, class string
+		var id, siteID, name, class string
 		var rx, tx int64
-		if err := rows.Scan(&id, &siteID, &class, &rx, &tx); err != nil {
+		if err := rows.Scan(&id, &siteID, &name, &class, &rx, &tx); err != nil {
 			return nil, err
 		}
 		pos, ok := index[id]
@@ -160,6 +164,7 @@ func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 			devices = append(devices, DeviceLedger{
 				ID:     id,
 				SiteID: siteID,
+				Name:   name,
 				Bytes:  map[string]uint64{},
 			})
 		}
@@ -167,7 +172,16 @@ func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 			devices[pos].Bytes[class] += uint64(rx) + uint64(tx)
 		}
 	}
-	return devices, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := s.attachDeviceEvidence(ctx, devices); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 func scanClassTotals(rows *sql.Rows) (map[string]uint64, error) {
@@ -192,12 +206,74 @@ func scanClassTotals(rows *sql.Rows) (map[string]uint64, error) {
 	return totals, rows.Err()
 }
 
+func deviceScope(group string) string {
+	if group == "device" {
+		return "1=1"
+	}
+	return "device_id = ''"
+}
+
+const (
+	SampleRetentionDays = 14
+	sampleRetention     = SampleRetentionDays * 24 * time.Hour
+	daySeconds      = 86400
+	bucket30m       = 1800
+	bucket2h        = 7200
+	range72h        = 72 * time.Hour
+	range7d         = 7 * 24 * time.Hour
+)
+
+func DefaultBucketSeconds(from, to time.Time) int {
+	if to.Before(from) {
+		from, to = to, from
+	}
+	delta := to.Sub(from)
+	switch {
+	case delta <= range72h:
+		return bucket30m
+	case delta <= range7d:
+		return bucket2h
+	default:
+		return daySeconds
+	}
+}
+
+func (s *Store) MaintainLedgers(ctx context.Context, now time.Time) error {
+	if err := s.RollupDaily(ctx, now); err != nil {
+		return err
+	}
+	return s.PurgeSamples(ctx, now)
+}
+
+func (s *Store) RollupDaily(ctx context.Context, now time.Time) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO ledger_daily (day, site_id, node_id, device_id, class, outbound, rx, tx)
+		 SELECT (sampled_at / ?) * ?, site_id, node_id, device_id, class, outbound, SUM(rx), SUM(tx)
+		 FROM ledger_samples
+		 GROUP BY 1, site_id, node_id, device_id, class, outbound
+		 ON CONFLICT(day, site_id, node_id, device_id, class, outbound)
+		 DO UPDATE SET rx = excluded.rx, tx = excluded.tx`,
+		daySeconds,
+		daySeconds,
+	)
+	return err
+}
+
+func (s *Store) PurgeSamples(ctx context.Context, now time.Time) error {
+	cutoff := now.UTC().Add(-sampleRetention).Unix()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ledger_samples WHERE sampled_at < ?`, cutoff)
+	return err
+}
+
 type TrafficQuery struct {
 	From          time.Time
 	To            time.Time
 	BucketSeconds int
 	Class         string
 	Group         string
+	NodeID        string
+	DeviceID      string
 }
 
 type TrafficPoint struct {
@@ -213,8 +289,14 @@ type TrafficSeries struct {
 }
 
 func (s *Store) TrafficSeries(ctx context.Context, query TrafficQuery) (TrafficSeries, error) {
+	if query.To.IsZero() {
+		query.To = time.Now().UTC()
+	}
+	if query.From.IsZero() {
+		query.From = query.To.Add(-72 * time.Hour)
+	}
 	if query.BucketSeconds <= 0 {
-		query.BucketSeconds = 1800
+		query.BucketSeconds = DefaultBucketSeconds(query.From, query.To)
 	}
 	if query.Group == "" {
 		query.Group = "node"
@@ -222,30 +304,53 @@ func (s *Store) TrafficSeries(ctx context.Context, query TrafficQuery) (TrafficS
 	if query.Class == "" {
 		query.Class = accounting.ClassTotal
 	}
-	if query.To.IsZero() {
-		query.To = time.Now().UTC()
-	}
-	if query.From.IsZero() {
-		query.From = query.To.Add(-72 * time.Hour)
+
+	table := "ledger_samples"
+	timeCol := "sampled_at"
+	if query.To.Sub(query.From) > range7d {
+		table = "ledger_daily"
+		timeCol = "day"
 	}
 
 	keyExpr := "node_id"
 	whereClass := `class = ?`
 	fromUnix := query.From.UTC().Unix()
 	toUnix := query.To.UTC().Unix()
-	args := []any{query.BucketSeconds, query.BucketSeconds, query.Class, fromUnix, toUnix}
-	if query.Group == "class" {
+	args := []any{query.BucketSeconds, query.BucketSeconds, query.Class}
+	switch query.Group {
+	case "class":
 		keyExpr = "class"
 		whereClass = `class IN ('direct', 'proxy_raw', 'proxy_adjusted', 'proxy_unadjusted')`
-		args = []any{query.BucketSeconds, query.BucketSeconds, fromUnix, toUnix}
+		args = []any{query.BucketSeconds, query.BucketSeconds}
+	case "outbound":
+		keyExpr = "outbound"
+		whereClass = `class = ? AND outbound != ''`
+	case "device":
+		keyExpr = "device_id"
+		whereClass = `class = ? AND device_id != ''`
 	}
+
+	var filters []string
+	if query.NodeID != "" {
+		filters = append(filters, "node_id = ?")
+		args = append(args, query.NodeID)
+	}
+	if query.DeviceID != "" {
+		filters = append(filters, "device_id = ?")
+		args = append(args, query.DeviceID)
+	}
+	extra := "1=1"
+	if len(filters) > 0 {
+		extra = strings.Join(filters, " AND ")
+	}
+	args = append(args, fromUnix, toUnix)
 
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT (sampled_at / ?) * ? AS bucket, `+keyExpr+`, SUM(rx + tx)
-		 FROM ledger_samples
-		 WHERE device_id = '' AND `+whereClass+`
-		   AND sampled_at >= ? AND sampled_at < ?
+		`SELECT (`+timeCol+` / ?) * ? AS bucket, `+keyExpr+`, SUM(rx + tx)
+		 FROM `+table+`
+		 WHERE `+deviceScope(query.Group)+` AND `+whereClass+` AND `+extra+`
+		   AND `+timeCol+` >= ? AND `+timeCol+` <= ?
 		 GROUP BY bucket, `+keyExpr+`
 		 ORDER BY bucket, `+keyExpr,
 		args...,
