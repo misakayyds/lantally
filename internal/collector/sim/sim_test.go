@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lantally/lantally/internal/protocol"
+	"github.com/misakayyds/lantally/internal/protocol"
 )
 
 func TestSnapshotUsesSyntheticAddresses(t *testing.T) {

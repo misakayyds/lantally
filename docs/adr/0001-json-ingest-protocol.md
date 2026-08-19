@@ -15,7 +15,7 @@ Agents run on OpenWrt and Linux. Operators need to inspect a failed batch withou
 - `protocol_version` is an integer. v0.1 accepts only `1`. Unknown versions are rejected.
 - JSON Schema lives in `proto/v1/batch.schema.json`. Shared Go types live in `internal/protocol`.
 - Idempotency key is `node_id + boot_id + sequence`.
-- Go module path is `github.com/lantally/lantally` until a public remote exists. Renaming changes imports only, never the wire format.
+- Go module path is `github.com/misakayyds/lantally`. Renaming changes imports only, never the wire format.
 - Language floor is Go 1.26.
 
 ## Consequences

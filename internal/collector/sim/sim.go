@@ -3,7 +3,7 @@ package sim
 import (
 	"time"
 
-	"github.com/lantally/lantally/internal/protocol"
+	"github.com/misakayyds/lantally/internal/protocol"
 )
 
 const (
