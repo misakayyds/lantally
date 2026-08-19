@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lantally.dev/proto/v1/batch.schema.json",
+  "title": "LanTally Ingest Batch v1",
+  "type": "object",
+  "required": [
+    "protocol_version",
+    "site_id",
+    "node_id",
+    "boot_id",
+    "sequence",
+    "sampled_at",
+    "interval_ms"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "site_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "boot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sampled_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "interval_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["iface", "conntrack", "nlbwmon", "mihomo"]
+      }
+    },
+    "interfaces": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/iface_delta" }
+    },
+    "devices": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/device_delta" }
+    },
+    "proxy": {
+      "$ref": "#/$defs/proxy_delta"
+    },
+    "gaps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/gap" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "iface_delta": {
+      "type": "object",
+      "required": ["name", "rx_delta", "tx_delta"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rx_delta": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tx_delta": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "device_delta": {
+      "type": "object",
+      "required": ["obs_ip", "rx_delta", "tx_delta", "source"],
+      "properties": {
+        "obs_ip": {
+          "type": "string",
+          "minLength": 1
+        },
+        "obs_mac": {
+          "type": "string"
+        },
+        "rx_delta": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tx_delta": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "enum": ["nlbwmon", "mihomo", "neigh"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "proxy_delta": {
+      "type": "object",
+      "required": ["by_outbound"],
+      "properties": {
+        "by_outbound": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/outbound_delta" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "outbound_delta": {
+      "type": "object",
+      "required": [
+        "name",
+        "direct_rx",
+        "direct_tx",
+        "proxy_rx",
+        "proxy_tx",
+        "unadjusted"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "direct_rx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "direct_tx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "proxy_rx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "proxy_tx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unadjusted": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "gap": {
+      "type": "object",
+      "required": ["reason", "from", "to"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": ["reboot", "buffer_drop", "collector_reset"]
+        },
+        "from": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "to": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
