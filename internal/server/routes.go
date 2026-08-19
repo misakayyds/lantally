@@ -57,6 +57,7 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/ingest", ingestHandler.Ingest)
 	mux.HandleFunc("GET /healthz", ingestHandler.Healthz)
 	mux.HandleFunc("POST /v1/login", loginHandler(store, sessions))
+	mux.HandleFunc("POST /v1/logout", logoutHandler(sessions))
 	mux.HandleFunc("POST /v1/enroll", requireSession(sessions, enrollHandler(store)))
 	mux.HandleFunc("GET /v1/overview", requireSession(sessions, overviewHandler(store)))
 	mux.HandleFunc("GET /v1/devices", requireSession(sessions, emptyListHandler("devices")))
@@ -104,6 +105,25 @@ func loginHandler(store *sqlitestore.Store, sessions *sessionStore) http.Handler
 			Name:     "lantally_session",
 			Value:    token,
 			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func logoutHandler(sessions *sessionStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cookie, err := r.Cookie("lantally_session"); err == nil {
+			sessions.mu.Lock()
+			delete(sessions.sessions, cookie.Value)
+			sessions.mu.Unlock()
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "lantally_session",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
 			HttpOnly: true,
 			SameSite: http.SameSiteStrictMode,
 		})
