@@ -1,0 +1,8 @@
+{
+  "name": "lantally-web",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "echo \"dist is checked in for v0.1 bootstrap\""
+  }
+}

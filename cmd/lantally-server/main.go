@@ -2,14 +2,16 @@ package main
 
 import (
 	"flag"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/misakayyds/lantally/internal/ingest"
+	"github.com/misakayyds/lantally/internal/server"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
+	webassets "github.com/misakayyds/lantally/web"
 )
 
 func main() {
@@ -26,11 +28,20 @@ func main() {
 	}
 	defer store.Close()
 
-	server := &http.Server{
+	if err := server.EnsureFirstRunAdmin(store, os.Stdout); err != nil {
+		log.Fatal(err)
+	}
+
+	staticFS, err := fs.Sub(webassets.Dist, "dist")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	httpServer := &http.Server{
 		Addr:              *listenAddr,
-		Handler:           ingest.Routes(store),
+		Handler:           server.Routes(store, server.Config{StaticFS: staticFS}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Printf("lantally-server listening on %s", *listenAddr)
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(httpServer.ListenAndServe())
 }
