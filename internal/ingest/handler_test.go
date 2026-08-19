@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -51,6 +52,50 @@ func postBatch(t *testing.T, handler http.Handler, token string, raw []byte) *ht
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec
+}
+
+type failOnRead struct {
+	reads int
+}
+
+func (r *failOnRead) Read([]byte) (int, error) {
+	r.reads++
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestIngestAuthenticatesBeforeReadingBody(t *testing.T) {
+	_, handler := testServer(t)
+	tests := []struct {
+		name          string
+		authorization string
+	}{
+		{name: "missing authorization"},
+		{
+			name:          "bad credential",
+			authorization: "Bearer " + syntheticToken("missing", 'z'),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &failOnRead{}
+			req := httptest.NewRequest(http.MethodPost, "/v1/ingest", body)
+			req.Header.Set("Content-Encoding", "gzip")
+			req.Header.Set("Content-Type", "application/json")
+			if tt.authorization != "" {
+				req.Header.Set("Authorization", tt.authorization)
+			}
+			rec := httptest.NewRecorder()
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+			}
+			if body.reads != 0 {
+				t.Fatalf("unauthorized request body was read %d times", body.reads)
+			}
+		})
+	}
 }
 
 func TestIngestRetryStoresOneBatchAndStablePayloadHash(t *testing.T) {
