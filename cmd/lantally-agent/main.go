@@ -167,7 +167,7 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 	if a.firstBatch {
 		batch.Gaps = append(batch.Gaps, protocol.Gap{
 			Reason: protocol.GapReboot,
-			From:   at.Add(-a.config.Interval),
+			From:   at,
 			To:     at,
 		})
 		a.firstBatch = false
@@ -209,10 +209,11 @@ func newBatchQueue(capacity int) *batchQueue {
 }
 
 func (q *batchQueue) Push(batch protocol.Batch) {
-	var droppedFrom time.Time
+	var dropped protocol.Batch
+	didDrop := false
 	if q.size == q.capacity {
-		dropped := q.items[q.head]
-		droppedFrom = earliestBufferDrop(dropped)
+		dropped = q.items[q.head]
+		didDrop = true
 		q.items[q.head] = protocol.Batch{}
 		q.head = (q.head + 1) % q.capacity
 		q.size--
@@ -220,19 +221,35 @@ func (q *batchQueue) Push(batch protocol.Batch) {
 	tail := (q.head + q.size) % q.capacity
 	q.items[tail] = batch
 	q.size++
-	if !droppedFrom.IsZero() {
-		carryBufferDrop(&q.items[q.head], droppedFrom, batch.SampledAt)
+	if didDrop {
+		carryDroppedLossGaps(&q.items[q.head], dropped, batch.SampledAt)
 	}
 }
 
-func earliestBufferDrop(dropped protocol.Batch) time.Time {
-	earliest := dropped.SampledAt
+func carryDroppedLossGaps(survivor *protocol.Batch, dropped protocol.Batch, dropTo time.Time) {
+	bufferFrom := dropped.SampledAt
 	for _, gap := range dropped.Gaps {
-		if gap.Reason == protocol.GapBufferDrop && (earliest.IsZero() || gap.From.Before(earliest)) {
-			earliest = gap.From
+		switch gap.Reason {
+		case protocol.GapReboot:
+			carryRebootGap(survivor, gap)
+		case protocol.GapBufferDrop:
+			if bufferFrom.IsZero() || gap.From.Before(bufferFrom) {
+				bufferFrom = gap.From
+			}
 		}
 	}
-	return earliest
+	if !bufferFrom.IsZero() {
+		carryBufferDrop(survivor, bufferFrom, dropTo)
+	}
+}
+
+func carryRebootGap(batch *protocol.Batch, reboot protocol.Gap) {
+	for _, gap := range batch.Gaps {
+		if gap.Reason == protocol.GapReboot {
+			return
+		}
+	}
+	batch.Gaps = append(batch.Gaps, reboot)
 }
 
 func carryBufferDrop(batch *protocol.Batch, from, to time.Time) {

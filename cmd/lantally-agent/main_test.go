@@ -96,7 +96,7 @@ func TestFirstBatchRecordsRebootGap(t *testing.T) {
 	if len(first.Gaps) != 1 || first.Gaps[0].Reason != protocol.GapReboot {
 		t.Fatalf("first batch reboot gap missing: %+v", first.Gaps)
 	}
-	if !first.Gaps[0].From.Equal(at.Add(-cfg.Interval)) || !first.Gaps[0].To.Equal(at) {
+	if !first.Gaps[0].From.Equal(at) || !first.Gaps[0].To.Equal(at) {
 		t.Fatalf("first batch reboot gap bounds = %+v", first.Gaps[0])
 	}
 	second := a.collect(context.Background(), at.Add(cfg.Interval))
@@ -150,6 +150,50 @@ func TestBatchQueueRepeatedOverflowCarriesEarliestBoundary(t *testing.T) {
 	if !gap.From.Equal(t0) || !gap.To.Equal(t0.Add(4*time.Second)) {
 		t.Fatalf("carried gap = %+v, want earliest from %s through %s", gap, t0, t0.Add(4*time.Second))
 	}
+}
+
+func TestBatchQueueOverflowCarriesRebootGapToSurvivingHead(t *testing.T) {
+	q := newBatchQueue(2)
+	t0 := time.Unix(1_700_000_000, 0).UTC()
+	q.Push(protocol.Batch{
+		Sequence:  1,
+		SampledAt: t0,
+		Gaps: []protocol.Gap{{
+			Reason: protocol.GapReboot,
+			From:   t0,
+			To:     t0,
+		}},
+	})
+	for sequence := uint64(2); sequence <= 4; sequence++ {
+		q.Push(protocol.Batch{
+			Sequence:  sequence,
+			SampledAt: t0.Add(time.Duration(sequence-1) * time.Second),
+		})
+	}
+
+	nextSent := q.Peek()
+	if nextSent.Sequence != 3 {
+		t.Fatalf("oldest surviving sequence = %d, want 3", nextSent.Sequence)
+	}
+	reboot, ok := gapByReason(nextSent.Gaps, protocol.GapReboot)
+	if !ok {
+		t.Fatalf("reboot gap was lost after repeated overflow: %+v", nextSent.Gaps)
+	}
+	if !reboot.From.Equal(t0) || !reboot.To.Equal(t0) {
+		t.Fatalf("reboot marker changed during carry: %+v", reboot)
+	}
+	if _, ok := gapByReason(nextSent.Gaps, protocol.GapBufferDrop); !ok {
+		t.Fatalf("buffer-drop gap missing beside reboot gap: %+v", nextSent.Gaps)
+	}
+}
+
+func gapByReason(gaps []protocol.Gap, reason protocol.GapReason) (protocol.Gap, bool) {
+	for _, gap := range gaps {
+		if gap.Reason == reason {
+			return gap, true
+		}
+	}
+	return protocol.Gap{}, false
 }
 
 func TestBackoffIsBoundedAndIncreases(t *testing.T) {
