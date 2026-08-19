@@ -2,7 +2,7 @@
 
 LanTally is a privacy-first, self-hosted traffic ledger for home and small networks. Lightweight agents report per-device usage to a central server, which separates direct and proxied traffic, accounts for proxy-node multipliers, and presents a unified history across multiple gateways.
 
-> Status: v0.1 design and implementation plan are approved. There is no working release yet; do not start from memory, follow the plan.
+> Status: v0.1 design and implementation plan are approved. Milestone 1 is on `main`. There is no working release yet; follow the plan. Source: https://github.com/misakayyds/lantally
 
 ## v0.1 scope
 

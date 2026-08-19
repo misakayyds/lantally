@@ -1,6 +1,6 @@
 # Contributing to LanTally
 
-LanTally has an approved v0.1 design and implementation plan. There is no application code yet. Contributions must preserve the privacy-first and read-only v0.1 boundary.
+LanTally has an approved v0.1 design and implementation plan. Contributions must preserve the privacy-first and read-only v0.1 boundary.
 
 ## Before contributing
 
@@ -13,7 +13,7 @@ LanTally has an approved v0.1 design and implementation plan. There is no applic
 ## Locked toolchain (v0.1)
 
 - Go 1.26 (patch `go1.26.6` at plan time).
-- Module path: `github.com/lantally/lantally` until a public remote exists.
+- Module path: `github.com/misakayyds/lantally`.
 - SQLite driver: `modernc.org/sqlite` (no CGO).
 - VictoriaMetrics single-node **v1.150.0** in the all-in-one image.
 - UI (from milestone 7): React 19, TypeScript, Vite.
