@@ -38,12 +38,6 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(r.Body, protocol.MaxDecodeSize+1))
-	if err != nil || len(raw) > protocol.MaxDecodeSize || !isGzip(raw) {
-		http.Error(w, "invalid gzip batch", http.StatusBadRequest)
-		return
-	}
-
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -56,6 +50,12 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(r.Body, protocol.MaxDecodeSize+1))
+	if err != nil || len(raw) > protocol.MaxDecodeSize || !isGzip(raw) {
+		http.Error(w, "invalid gzip batch", http.StatusBadRequest)
 		return
 	}
 

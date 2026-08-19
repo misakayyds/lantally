@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"path/filepath"
@@ -20,6 +21,74 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func TestOpenMigratesLegacyNodesTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+		CREATE TABLE nodes (
+			id TEXT PRIMARY KEY,
+			site_id TEXT NOT NULL,
+			token_hash BLOB NOT NULL,
+			revoked INTEGER NOT NULL DEFAULT 0
+		)
+	`)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(
+		`INSERT INTO nodes (id, site_id, token_hash) VALUES (?, ?, ?)`,
+		"legacy-node",
+		"site-a",
+		enroll.HashToken(tokenFor("legacy-cred", 'l')),
+	)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	token := tokenFor("migrated-cred", 'm')
+	if err := store.CreateNode(
+		context.Background(),
+		"migrated-node",
+		"site-a",
+		"migrated-cred",
+		enroll.HashToken(token),
+	); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.Authenticate(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.ID != "migrated-node" {
+		t.Fatalf("authenticated node = %q, want migrated-node", node.ID)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Authenticate(context.Background(), token); err != nil {
+		t.Fatalf("authenticate after idempotent reopen: %v", err)
+	}
 }
 
 func tokenFor(credentialID string, fill byte) string {

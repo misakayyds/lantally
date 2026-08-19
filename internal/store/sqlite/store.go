@@ -43,16 +43,75 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	schema, err := migrations.ReadFile("migrations/0001_init.sql")
-	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec(string(schema)); err != nil {
+	if err := applyMigrations(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return store, nil
+}
+
+// applyMigrations applies the numbered schema steps needed by both new and
+// pre-credential-id databases.
+func applyMigrations(db *sql.DB) error {
+	schema, err := migrations.ReadFile("migrations/0001_init.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(schema)); err != nil {
+		return err
+	}
+
+	hasCredentialID, err := tableHasColumn(db, "nodes", "credential_id")
+	if err != nil {
+		return err
+	}
+	if !hasCredentialID {
+		migration, err := migrations.ReadFile("migrations/0002_add_node_credential_id.sql")
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(string(migration)); err != nil {
+			return err
+		}
+	}
+	_, err = db.Exec(`
+		CREATE UNIQUE INDEX IF NOT EXISTS nodes_credential_id_uq
+		ON nodes(credential_id)
+	`)
+	return err
+}
+
+func tableHasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid          int
+			name         string
+			columnType   string
+			notNull      int
+			defaultValue any
+			primaryKey   int
+		)
+		if err := rows.Scan(
+			&cid,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) Close() error {
