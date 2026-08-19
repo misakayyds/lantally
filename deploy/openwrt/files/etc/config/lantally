@@ -1,0 +1,8 @@
+config agent 'main'
+	option enabled '0'
+	option server_url 'https://lantally.example.test'
+	option site_id 'site-id'
+	option node_id 'node-id'
+	option token_file '/etc/lantally/token'
+	option interval '15s'
+	option iface '1'

@@ -1,0 +1,372 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	mathrand "math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"strings"
+	"time"
+
+	ifacecollector "github.com/misakayyds/lantally/internal/collector/iface"
+	"github.com/misakayyds/lantally/internal/protocol"
+)
+
+const (
+	defaultQueueCapacity = 128
+	defaultInterval      = 15 * time.Second
+)
+
+type Config struct {
+	ServerURL  string
+	SiteID     string
+	NodeID     string
+	TokenFile  string
+	Interval   time.Duration
+	Collectors struct {
+		Iface bool
+	}
+}
+
+type configFile struct {
+	ServerURL  string `json:"server_url"`
+	SiteID     string `json:"site_id"`
+	NodeID     string `json:"node_id"`
+	TokenFile  string `json:"token_file"`
+	Interval   string `json:"interval"`
+	Collectors struct {
+		Iface bool `json:"iface"`
+	} `json:"collectors"`
+}
+
+func LoadConfig(filename string) (Config, error) {
+	var raw configFile
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return Config{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return Config{}, err
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return Config{}, err
+	}
+	interval := defaultInterval
+	if raw.Interval != "" {
+		interval, err = time.ParseDuration(raw.Interval)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse interval: %w", err)
+		}
+	}
+	cfg := Config{
+		ServerURL: raw.ServerURL,
+		SiteID:    raw.SiteID,
+		NodeID:    raw.NodeID,
+		TokenFile: raw.TokenFile,
+		Interval:  interval,
+	}
+	cfg.Collectors.Iface = raw.Collectors.Iface
+	if cfg.ServerURL == "" || cfg.SiteID == "" || cfg.NodeID == "" || cfg.TokenFile == "" {
+		return Config{}, errors.New("server_url, site_id, node_id, and token_file are required")
+	}
+	if cfg.Interval <= 0 {
+		return Config{}, errors.New("interval must be positive")
+	}
+	if _, err := url.ParseRequestURI(cfg.ServerURL); err != nil {
+		return Config{}, fmt.Errorf("parse server_url: %w", err)
+	}
+	return cfg, nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("config contains trailing JSON")
+		}
+		return err
+	}
+	return nil
+}
+
+func loadToken(filename string) (string, error) {
+	raw, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return "", errors.New("token file must contain one full bearer token")
+	}
+	return token, nil
+}
+
+type collector interface {
+	Capability() protocol.Capability
+	Collect(context.Context, time.Time) ([]protocol.IfaceDelta, []protocol.Gap, error)
+}
+
+type namedCollector struct {
+	name      string
+	collector collector
+}
+
+type agent struct {
+	config     Config
+	bootID     string
+	sequence   uint64
+	collectors []namedCollector
+}
+
+func newAgent(config Config, bootID string, available map[string]collector) *agent {
+	a := &agent{config: config, bootID: bootID}
+	for name, candidate := range available {
+		if name == "iface" && !config.Collectors.Iface {
+			continue
+		}
+		a.collectors = append(a.collectors, namedCollector{name: name, collector: candidate})
+	}
+	return a
+}
+
+func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
+	a.sequence++
+	batch := protocol.Batch{
+		ProtocolVersion: 1,
+		SiteID:          a.config.SiteID,
+		NodeID:          a.config.NodeID,
+		BootID:          a.bootID,
+		Sequence:        a.sequence,
+		SampledAt:       at.UTC(),
+		IntervalMS:      int(a.config.Interval / time.Millisecond),
+		Capabilities:    []protocol.Capability{},
+		Interfaces:      []protocol.IfaceDelta{},
+		Devices:         []protocol.DeviceDelta{},
+	}
+	seenCapabilities := make(map[protocol.Capability]struct{})
+	for _, registered := range a.collectors {
+		capability := registered.collector.Capability()
+		if _, exists := seenCapabilities[capability]; !exists {
+			batch.Capabilities = append(batch.Capabilities, capability)
+			seenCapabilities[capability] = struct{}{}
+		}
+		deltas, gaps, err := registered.collector.Collect(ctx, at)
+		if err != nil {
+			batch.Gaps = append(batch.Gaps, protocol.Gap{
+				Reason: protocol.GapCollectorReset,
+				From:   at.Add(-a.config.Interval),
+				To:     at,
+			})
+			continue
+		}
+		batch.Interfaces = append(batch.Interfaces, deltas...)
+		batch.Gaps = append(batch.Gaps, gaps...)
+	}
+	return batch
+}
+
+type batchQueue struct {
+	capacity int
+	items    []protocol.Batch
+	head     int
+	size     int
+}
+
+func newBatchQueue(capacity int) *batchQueue {
+	if capacity <= 0 {
+		panic("batch queue capacity must be positive")
+	}
+	return &batchQueue{capacity: capacity, items: make([]protocol.Batch, capacity)}
+}
+
+func (q *batchQueue) Push(batch protocol.Batch) {
+	if q.size == q.capacity {
+		dropped := q.items[q.head]
+		q.items[q.head] = protocol.Batch{}
+		q.head = (q.head + 1) % q.capacity
+		q.size--
+		batch.Gaps = append(batch.Gaps, protocol.Gap{
+			Reason: protocol.GapBufferDrop,
+			From:   dropped.SampledAt,
+			To:     batch.SampledAt,
+		})
+	}
+	tail := (q.head + q.size) % q.capacity
+	q.items[tail] = batch
+	q.size++
+}
+
+func (q *batchQueue) Peek() protocol.Batch {
+	if q.size == 0 {
+		panic("peek empty batch queue")
+	}
+	return q.items[q.head]
+}
+
+func (q *batchQueue) Pop() {
+	if q.size == 0 {
+		panic("pop empty batch queue")
+	}
+	q.items[q.head] = protocol.Batch{}
+	q.head = (q.head + 1) % q.capacity
+	q.size--
+}
+
+func (q *batchQueue) Len() int {
+	return q.size
+}
+
+type backoff struct {
+	initial time.Duration
+	maximum time.Duration
+	current time.Duration
+	random  func() float64
+}
+
+func newBackoff(initial, maximum time.Duration, random func() float64) *backoff {
+	return &backoff{initial: initial, maximum: maximum, random: random}
+}
+
+func (b *backoff) Next() time.Duration {
+	if b.current == 0 {
+		b.current = b.initial
+	} else if b.current < b.maximum {
+		b.current *= 2
+		if b.current > b.maximum {
+			b.current = b.maximum
+		}
+	}
+	jittered := time.Duration(float64(b.current) * (0.5 + b.random()))
+	if jittered > b.maximum {
+		return b.maximum
+	}
+	return jittered
+}
+
+func (b *backoff) Reset() {
+	b.current = 0
+}
+
+func postBatch(ctx context.Context, client *http.Client, serverURL, token string, batch protocol.Batch) error {
+	payload, err := protocol.Encode(batch)
+	if err != nil {
+		return err
+	}
+	endpoint, err := url.Parse(serverURL)
+	if err != nil {
+		return err
+	}
+	endpoint.Path = path.Join(strings.TrimSuffix(endpoint.Path, "/"), "/v1/ingest")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Encoding", "gzip")
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("ingest returned %s", response.Status)
+	}
+	return nil
+}
+
+func run(ctx context.Context, cfg Config, token, bootID string) error {
+	a := newAgent(cfg, bootID, map[string]collector{"iface": ifacecollector.NewCollector()})
+	queue := newBatchQueue(defaultQueueCapacity)
+	client := &http.Client{Timeout: 30 * time.Second}
+	retry := newBackoff(time.Second, time.Minute, mathrand.Float64)
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+
+	var retryTimer *time.Timer
+	var retryC <-chan time.Time
+	collectAndQueue := func(at time.Time) {
+		queue.Push(a.collect(ctx, at))
+	}
+	deliver := func() {
+		for queue.Len() > 0 {
+			if err := postBatch(ctx, client, cfg.ServerURL, token, queue.Peek()); err != nil {
+				delay := retry.Next()
+				log.Printf("ingest failed; retrying in %s: %v", delay, err)
+				retryTimer = time.NewTimer(delay)
+				retryC = retryTimer.C
+				return
+			}
+			queue.Pop()
+			retry.Reset()
+		}
+		retryC = nil
+	}
+
+	collectAndQueue(time.Now())
+	deliver()
+	for {
+		select {
+		case <-ctx.Done():
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+			return ctx.Err()
+		case at := <-ticker.C:
+			collectAndQueue(at)
+			if retryC == nil {
+				deliver()
+			}
+		case <-retryC:
+			retryC = nil
+			deliver()
+		}
+	}
+}
+
+func bootID() (string, error) {
+	if raw, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+		if value := strings.TrimSpace(string(raw)); value != "" {
+			return value, nil
+		}
+	}
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func main() {
+	configPath := flag.String("config", "/etc/lantally-agent.json", "path to agent JSON config")
+	flag.Parse()
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	token, err := loadToken(cfg.TokenFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	id, err := bootID()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := run(context.Background(), cfg, token, id); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatal(err)
+	}
+}
