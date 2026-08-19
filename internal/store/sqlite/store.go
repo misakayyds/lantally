@@ -78,6 +78,15 @@ func applyMigrations(db *sql.DB) error {
 		CREATE UNIQUE INDEX IF NOT EXISTS nodes_credential_id_uq
 		ON nodes(credential_id)
 	`)
+	if err != nil {
+		return err
+	}
+
+	devicesMigration, err := migrations.ReadFile("migrations/0003_devices.sql")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(string(devicesMigration))
 	return err
 }
 
