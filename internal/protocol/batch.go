@@ -1,6 +1,9 @@
 package protocol
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Capability string
 
@@ -31,7 +34,8 @@ type Batch struct {
 	Interfaces      []IfaceDelta  `json:"interfaces"`
 	Devices         []DeviceDelta `json:"devices"`
 	Proxy           *ProxyDelta   `json:"proxy,omitempty"`
-	Gaps            []Gap         `json:"gaps,omitempty"`
+	Gaps            []Gap           `json:"gaps,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty"`
 }
 
 type IfaceDelta struct {
