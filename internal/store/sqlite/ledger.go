@@ -137,7 +137,7 @@ func (s *Store) NodeLedgerTotals(ctx context.Context, siteID, nodeID string) (ma
 func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT d.id, d.site_id, IFNULL(t.class, ''), IFNULL(t.rx, 0), IFNULL(t.tx, 0)
+		`SELECT d.id, d.site_id, IFNULL(d.display_name, ''), IFNULL(t.class, ''), IFNULL(t.rx, 0), IFNULL(t.tx, 0)
 		 FROM devices d
 		 LEFT JOIN ledger_totals t
 		   ON t.device_id = d.id AND t.site_id = d.site_id
@@ -152,9 +152,9 @@ func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 	index := map[string]int{}
 	var devices []DeviceLedger
 	for rows.Next() {
-		var id, siteID, class string
+		var id, siteID, name, class string
 		var rx, tx int64
-		if err := rows.Scan(&id, &siteID, &class, &rx, &tx); err != nil {
+		if err := rows.Scan(&id, &siteID, &name, &class, &rx, &tx); err != nil {
 			return nil, err
 		}
 		pos, ok := index[id]
@@ -164,6 +164,7 @@ func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 			devices = append(devices, DeviceLedger{
 				ID:     id,
 				SiteID: siteID,
+				Name:   name,
 				Bytes:  map[string]uint64{},
 			})
 		}
@@ -171,7 +172,16 @@ func (s *Store) ListDeviceLedgers(ctx context.Context) ([]DeviceLedger, error) {
 			devices[pos].Bytes[class] += uint64(rx) + uint64(tx)
 		}
 	}
-	return devices, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := s.attachDeviceEvidence(ctx, devices); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 func scanClassTotals(rows *sql.Rows) (map[string]uint64, error) {

@@ -49,6 +49,20 @@ func main() {
 		}
 	}()
 
+	go func() {
+		run := func() {
+			if err := store.EvaluateAlerts(context.Background(), time.Now().UTC()); err != nil {
+				log.Printf("alert evaluation: %v", err)
+			}
+		}
+		run()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			run()
+		}
+	}()
+
 	staticFS, err := fs.Sub(webassets.Dist, "dist")
 	if err != nil {
 		log.Fatal(err)

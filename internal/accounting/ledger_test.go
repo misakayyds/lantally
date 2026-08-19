@@ -126,8 +126,14 @@ func TestDeviceIncrementsKeepMihomoOutbound(t *testing.T) {
 		Outbound: "proxy-a",
 	}
 	got := DeviceIncrements(proxy, "dev-a", nil)
-	if len(got) != 1 || got[0].DeviceID != "dev-a" || got[0].Class != ClassProxyRaw || got[0].Outbound != "proxy-a" || got[0].Rx != 9 || got[0].Tx != 1 {
+	if len(got) != 2 {
 		t.Fatalf("mihomo proxy increment = %+v", got)
+	}
+	if got[0].DeviceID != "dev-a" || got[0].Class != ClassProxyRaw || got[0].Outbound != "proxy-a" || got[0].Rx != 9 || got[0].Tx != 1 {
+		t.Fatalf("mihomo proxy raw = %+v", got[0])
+	}
+	if got[1].Class != ClassProxyUnadjusted || got[1].Outbound != "proxy-a" {
+		t.Fatalf("nil multiplier must stay unadjusted, got %+v", got)
 	}
 
 	direct := protocol.DeviceDelta{
@@ -140,6 +146,27 @@ func TestDeviceIncrementsKeepMihomoOutbound(t *testing.T) {
 	got = DeviceIncrements(direct, "dev-b", nil)
 	if len(got) != 1 || got[0].Class != ClassDirect || got[0].Outbound != "" || got[0].Rx != 4 || got[0].Tx != 2 {
 		t.Fatalf("mihomo direct increment = %+v", got)
+	}
+}
+
+func TestDeviceIncrementsApplyMultiplier(t *testing.T) {
+	proxy := protocol.DeviceDelta{
+		ObsIP:    "192.168.0.10",
+		RxDelta:  100,
+		TxDelta:  0,
+		Source:   protocol.SourceMihomo,
+		Outbound: "ss-test",
+	}
+	got := DeviceIncrements(proxy, "dev-a", map[string]float64{"ss-test": 1.5})
+	totals := map[string]uint64{}
+	for _, item := range got {
+		if item.DeviceID != "dev-a" || item.Outbound != "ss-test" {
+			t.Fatalf("unexpected increment %+v", item)
+		}
+		totals[item.Class] += item.Rx + item.Tx
+	}
+	if totals[ClassProxyRaw] != 100 || totals[ClassProxyAdjusted] != 150 || totals[ClassProxyUnadjusted] != 0 {
+		t.Fatalf("device multiplier increments = %+v", totals)
 	}
 }
 

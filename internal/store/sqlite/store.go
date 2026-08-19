@@ -36,7 +36,20 @@ type Node struct {
 type DeviceLedger struct {
 	ID     string            `json:"id"`
 	SiteID string            `json:"site_id"`
+	Name   string            `json:"name"`
+	IP     string            `json:"ip,omitempty"`
+	MAC    string            `json:"mac,omitempty"`
 	Bytes  map[string]uint64 `json:"bytes"`
+}
+
+type OutboundLedger struct {
+	Name       string  `json:"name"`
+	Raw        uint64  `json:"raw"`
+	Factor     float64 `json:"factor"`
+	Adjusted   uint64  `json:"adjusted"`
+	Unadjusted uint64  `json:"unadjusted"`
+	Configured bool    `json:"configured"`
+	Share      float64 `json:"share"`
 }
 
 func Open(dsn string) (*Store, error) {
@@ -140,7 +153,55 @@ func applyMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(string(dailyMigration))
+	if _, err := db.Exec(string(dailyMigration)); err != nil {
+		return err
+	}
+
+	multipliersMigration, err := migrations.ReadFile("migrations/0009_multipliers_devices.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(multipliersMigration)); err != nil {
+		return err
+	}
+	hasDisplayName, err := tableHasColumn(db, "devices", "display_name")
+	if err != nil {
+		return err
+	}
+	if !hasDisplayName {
+		if _, err := db.Exec(`ALTER TABLE devices ADD COLUMN display_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+
+	alertsMigration, err := migrations.ReadFile("migrations/0010_alerts_billing.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(alertsMigration)); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "last_seen_at", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "last_interval_ms", `INTEGER NOT NULL DEFAULT 15000`); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "last_boot_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func addNodeColumn(db *sql.DB, name, decl string) error {
+	has, err := tableHasColumn(db, "nodes", name)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE nodes ADD COLUMN ` + name + ` ` + decl)
 	return err
 }
 

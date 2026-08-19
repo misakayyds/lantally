@@ -498,3 +498,163 @@ func TestTrafficSeriesFiltersNodeAndDevice(t *testing.T) {
 		t.Fatalf("device filter = %+v", byDevice.Totals)
 	}
 }
+
+func TestMultiplierConfigRoundTrip(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if err := store.SetMultiplier(ctx, "ss-test", 1.5); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ListMultipliers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["ss-test"] != 1.5 {
+		t.Fatalf("multipliers = %+v", got)
+	}
+
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 1, time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC), []accounting.Increment{
+		{Class: accounting.ClassProxyRaw, Outbound: "ss-test", Rx: 100, Tx: 0},
+		{Class: accounting.ClassProxyRaw, Outbound: "unknown", Rx: 40, Tx: 0},
+		{Class: accounting.ClassProxyUnadjusted, Outbound: "unknown", Rx: 40, Tx: 0},
+		{Class: accounting.ClassProxyAdjusted, Outbound: "ss-test", Rx: 150, Tx: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListOutboundLedgers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]OutboundLedger{}
+	for _, row := range rows {
+		byName[row.Name] = row
+	}
+	if byName["ss-test"].Raw != 100 || byName["ss-test"].Adjusted != 150 || !byName["ss-test"].Configured || byName["ss-test"].Factor != 1.5 {
+		t.Fatalf("ss-test = %+v", byName["ss-test"])
+	}
+	if byName["unknown"].Raw != 40 || byName["unknown"].Configured || byName["unknown"].Unadjusted != 40 {
+		t.Fatalf("unknown = %+v", byName["unknown"])
+	}
+}
+
+func TestRenameDeviceUpdatesDisplayName(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO devices (id, site_id, created_at) VALUES (?, ?, ?)`, "dev-a", "home", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RenameDevice(ctx, "dev-a", "书房电脑"); err != nil {
+		t.Fatal(err)
+	}
+	devices, err := store.ListDeviceLedgers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].Name != "书房电脑" {
+		t.Fatalf("devices = %+v", devices)
+	}
+}
+
+func TestEvaluateSilenceAcknowledgedDoesNotRetrigger(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.CreateNode(ctx, "proxy-20", "home", "cred-a", []byte("hash")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchNode(ctx, "proxy-20", "boot-a", 15*time.Minute, now.Add(-46*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EvaluateAlerts(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	open, err := store.ListOpenAlerts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "silence" || open[0].NodeID != "proxy-20" {
+		t.Fatalf("open alerts = %+v", open)
+	}
+	if err := store.AckAlert(ctx, open[0].ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EvaluateAlerts(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	open, err = store.ListOpenAlerts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("acked silence retriggered: %+v", open)
+	}
+}
+
+func TestEvaluateGrowthUsesDailyMedian(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.CreateNode(ctx, "proxy-20", "home", "cred-a", []byte("hash")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 7; i++ {
+		day := now.AddDate(0, 0, -i)
+		if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", uint64(i), day, []accounting.Increment{
+			{Class: accounting.ClassTotal, Rx: 50, Tx: 50},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-b", 8, now, []accounting.Increment{
+		{Class: accounting.ClassTotal, Rx: 200, Tx: 200},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollupDaily(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EvaluateAlerts(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	open, err := store.ListOpenAlerts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "growth" {
+		t.Fatalf("growth alerts = %+v", open)
+	}
+}
+
+func TestBillingReconciliationComputesRatioAndDrift(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	if err := store.SetBilling(ctx, Billing{ResetDay: 1, ProviderBytes: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyLedgerOnce(ctx, "home", "proxy-20", "boot-a", 1, now, []accounting.Increment{
+		{Class: accounting.ClassProxyAdjusted, Outbound: "ss-test", Rx: 120, Tx: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RollupDaily(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	status, err := store.BillingStatus(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.LocalBytes != 120 || status.ProviderBytes != 100 || status.Ratio < 0.19 || status.Ratio > 0.21 {
+		t.Fatalf("billing status = %+v", status)
+	}
+	if err := store.EvaluateAlerts(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	open, err := store.ListOpenAlerts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Kind != "drift" {
+		t.Fatalf("drift alerts = %+v", open)
+	}
+}

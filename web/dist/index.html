@@ -78,6 +78,20 @@
             <p class="page-kicker" id="page-eyebrow">Dashboard</p>
             <h2 id="page-title">概览</h2>
           </div>
+          <div id="chart-toolbar" class="chart-toolbar" hidden>
+            <div class="chip-group" role="group" aria-label="时间范围">
+              <button type="button" class="chip-btn" data-range="24h">24h</button>
+              <button type="button" class="chip-btn" data-range="72h">72h</button>
+              <button type="button" class="chip-btn" data-range="7d">7d</button>
+              <button type="button" class="chip-btn" data-range="30d">30d</button>
+            </div>
+            <div class="chip-group" id="group-chips" role="group" aria-label="分组">
+              <button type="button" class="chip-btn" data-group="node">按节点</button>
+              <button type="button" class="chip-btn" data-group="device">按设备</button>
+              <button type="button" class="chip-btn" data-group="class">按类别</button>
+              <button type="button" class="chip-btn" data-group="outbound">按出口</button>
+            </div>
+          </div>
         </header>
 
         <section id="view-overview" class="page view active" data-view="overview">

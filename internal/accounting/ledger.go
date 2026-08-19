@@ -45,7 +45,6 @@ func NodeIncrements(batch protocol.Batch, multipliers map[string]float64) []Incr
 
 // DeviceIncrements attributes per-device bytes. Neigh observations are identity-only.
 func DeviceIncrements(obs protocol.DeviceDelta, deviceID string, multipliers map[string]float64) []Increment {
-	_ = multipliers
 	if deviceID == "" || obs.RxDelta+obs.TxDelta == 0 {
 		return nil
 	}
@@ -56,13 +55,35 @@ func DeviceIncrements(obs protocol.DeviceDelta, deviceID string, multipliers map
 		if obs.Outbound == "DIRECT" {
 			return []Increment{{DeviceID: deviceID, Class: ClassDirect, Rx: obs.RxDelta, Tx: obs.TxDelta}}
 		}
-		return []Increment{{
+		out := []Increment{{
 			DeviceID: deviceID,
 			Class:    ClassProxyRaw,
 			Outbound: obs.Outbound,
 			Rx:       obs.RxDelta,
 			Tx:       obs.TxDelta,
 		}}
+		rx, unadjRx := ApplyMultiplier(obs.RxDelta, obs.Outbound, multipliers)
+		tx, unadjTx := ApplyMultiplier(obs.TxDelta, obs.Outbound, multipliers)
+		if unadjRx || unadjTx {
+			out = append(out, Increment{
+				DeviceID: deviceID,
+				Class:    ClassProxyUnadjusted,
+				Outbound: obs.Outbound,
+				Rx:       obs.RxDelta,
+				Tx:       obs.TxDelta,
+			})
+			return out
+		}
+		if rx+tx > 0 {
+			out = append(out, Increment{
+				DeviceID: deviceID,
+				Class:    ClassProxyAdjusted,
+				Outbound: obs.Outbound,
+				Rx:       rx,
+				Tx:       tx,
+			})
+		}
+		return out
 	default:
 		return nil
 	}

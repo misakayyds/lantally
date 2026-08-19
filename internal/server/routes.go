@@ -2,8 +2,10 @@ package server
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/misakayyds/lantally/internal/identity"
 
 	"github.com/misakayyds/lantally/internal/enroll"
 	"github.com/misakayyds/lantally/internal/ingest"
@@ -68,9 +72,16 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("GET /v1/overview", requireSession(sessions, overviewHandler(store)))
 	mux.HandleFunc("GET /v1/traffic", requireSession(sessions, trafficHandler(store)))
 	mux.HandleFunc("GET /v1/devices", requireSession(sessions, devicesHandler(store)))
+	mux.HandleFunc("GET /v1/devices/{id}", requireSession(sessions, deviceDetailHandler(store)))
+	mux.HandleFunc("PUT /v1/devices/{id}", requireSession(sessions, renameDeviceHandler(store)))
+	mux.HandleFunc("POST /v1/devices/{id}/merge", requireSession(sessions, mergeDeviceHandler(store)))
+	mux.HandleFunc("POST /v1/devices/{id}/unmerge", requireSession(sessions, unmergeDeviceHandler(store)))
 	mux.HandleFunc("GET /v1/nodes", requireSession(sessions, nodesHandler(store)))
 	mux.HandleFunc("GET /v1/proxy", requireSession(sessions, proxyHandler(store)))
-	mux.HandleFunc("GET /v1/alerts", requireSession(sessions, emptyListHandler("alerts")))
+	mux.HandleFunc("PUT /v1/proxy/multipliers", requireSession(sessions, setMultiplierHandler(store)))
+	mux.HandleFunc("PUT /v1/proxy/billing", requireSession(sessions, setBillingHandler(store)))
+	mux.HandleFunc("GET /v1/alerts", requireSession(sessions, alertsHandler(store)))
+	mux.HandleFunc("POST /v1/alerts/{id}/ack", requireSession(sessions, ackAlertHandler(store)))
 	if cfg.StaticFS != nil {
 		mux.Handle("GET /{$}", http.FileServer(http.FS(cfg.StaticFS)))
 		mux.Handle("GET /styles.css", http.FileServer(http.FS(cfg.StaticFS)))
@@ -226,7 +237,17 @@ func proxyHandler(store *sqlitestore.Store) http.HandlerFunc {
 			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		traffic, err := lastTraffic(store, r, "class", "")
+		outbounds, err := store.ListOutboundLedgers(r.Context())
+		if err != nil {
+			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		traffic, err := lastTraffic(store, r, "outbound", "proxy_raw")
+		if err != nil {
+			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		billing, err := store.BillingStatus(r.Context(), time.Now().UTC())
 		if err != nil {
 			http.Error(w, "proxy unavailable", http.StatusServiceUnavailable)
 			return
@@ -238,8 +259,175 @@ func proxyHandler(store *sqlitestore.Store) http.HandlerFunc {
 				"proxy_adjusted":   bytes["proxy_adjusted"],
 				"proxy_unadjusted": bytes["proxy_unadjusted"],
 			},
-			"traffic": traffic,
+			"outbounds": outbounds,
+			"traffic":   traffic,
+			"billing":   billing,
 		})
+	}
+}
+
+func setMultiplierHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name   string  `json:"name"`
+			Factor float64 `json:"factor"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid multiplier", http.StatusBadRequest)
+			return
+		}
+		if err := store.SetMultiplier(r.Context(), body.Name, body.Factor); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func setBillingHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body sqlitestore.Billing
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid billing", http.StatusBadRequest)
+			return
+		}
+		if err := store.SetBilling(r.Context(), body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		now := time.Now().UTC()
+		if err := store.EvaluateAlerts(r.Context(), now); err != nil {
+			http.Error(w, "billing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		status, err := store.BillingStatus(r.Context(), now)
+		if err != nil {
+			http.Error(w, "billing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(status)
+	}
+}
+
+func alertsHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := store.EvaluateAlerts(r.Context(), time.Now().UTC()); err != nil {
+			http.Error(w, "alerts unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		alerts, err := store.ListOpenAlerts(r.Context())
+		if err != nil {
+			http.Error(w, "alerts unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if alerts == nil {
+			alerts = []sqlitestore.Alert{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"alerts": alerts})
+	}
+}
+
+func ackAlertHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid alert", http.StatusBadRequest)
+			return
+		}
+		if err := store.AckAlert(r.Context(), id, time.Now().UTC()); errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "alert not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "ack failed", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func deviceDetailHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		device, merged, err := store.GetDevice(r.Context(), id)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "device not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, "device unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device":      device,
+			"merged_from": merged,
+		})
+	}
+}
+
+func renameDeviceHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid device", http.StatusBadRequest)
+			return
+		}
+		id := r.PathValue("id")
+		if err := store.RenameDevice(r.Context(), id, body.Name); errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "device not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, "rename failed", http.StatusBadRequest)
+			return
+		}
+		device, merged, err := store.GetDevice(r.Context(), id)
+		if err != nil {
+			http.Error(w, "device unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device":      device,
+			"merged_from": merged,
+		})
+	}
+}
+
+func mergeDeviceHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			OtherID string `json:"other_id"`
+			Reason  string `json:"reason"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid merge", http.StatusBadRequest)
+			return
+		}
+		reason := strings.TrimSpace(body.Reason)
+		if reason == "" {
+			reason = "manual"
+		}
+		if err := store.MergeIdentities(
+			r.PathValue("id"),
+			strings.TrimSpace(body.OtherID),
+			int(identity.RankPinned),
+			reason,
+			time.Now().UTC(),
+		); err != nil {
+			http.Error(w, "merge failed", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func unmergeDeviceHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := store.UnmergeIdentity(r.PathValue("id")); err != nil {
+			http.Error(w, "unmerge failed", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }
 
@@ -352,6 +540,9 @@ func parseTrafficQuery(r *http.Request) (sqlitestore.TrafficQuery, error) {
 			return sqlitestore.TrafficQuery{}, fmt.Errorf("invalid bucket")
 		}
 		query.BucketSeconds = bucket
+	}
+	if query.Group == "outbound" && query.Class == "" {
+		query.Class = "proxy_raw"
 	}
 	return query, nil
 }
