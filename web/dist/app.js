@@ -6,6 +6,8 @@ const ROUTES = {
   alerts: { title: "告警", eyebrow: "Alerts" },
 };
 
+const EMPTY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>`;
+
 const loginScreen = document.getElementById("login-screen");
 const appShell = document.getElementById("app-shell");
 const loginForm = document.getElementById("login-form");
@@ -33,11 +35,11 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.remove("hidden");
   clearTimeout(showToast.timer);
-  showToast.timer = setTimeout(() => toast.classList.add("hidden"), 2600);
+  showToast.timer = setTimeout(() => toast.classList.add("hidden"), 2400);
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  return fetch(path, {
     credentials: "same-origin",
     ...options,
     headers: {
@@ -45,7 +47,6 @@ async function api(path, options = {}) {
       ...(options.headers || {}),
     },
   });
-  return response;
 }
 
 function setScreen(loggedIn) {
@@ -59,7 +60,7 @@ function setRoute(route) {
   if (!ROUTES[route]) route = "overview";
   currentRoute = route;
 
-  document.querySelectorAll(".nav-link").forEach((link) => {
+  document.querySelectorAll(".nav-item").forEach((link) => {
     link.classList.toggle("active", link.dataset.route === route);
   });
   document.querySelectorAll(".view").forEach((view) => {
@@ -77,23 +78,23 @@ function renderOverview(data) {
   const ledgers = data.ledgers ?? [];
 
   stats.innerHTML = `
-    <article class="stat-card accent">
-      <div class="label">已接收批次</div>
-      <div class="value">${count.toLocaleString("zh-CN")}</div>
+    <article class="metric">
+      <div class="metric-label">已接收批次</div>
+      <div class="metric-value brand">${count.toLocaleString("zh-CN")}</div>
     </article>
-    <article class="stat-card">
-      <div class="label">账本维度</div>
-      <div class="value">${ledgers.length}</div>
+    <article class="metric">
+      <div class="metric-label">账本维度</div>
+      <div class="metric-value">${ledgers.length}</div>
     </article>
-    <article class="stat-card">
-      <div class="label">服务状态</div>
-      <div class="value" style="font-size:1.1rem;color:var(--ok)">在线</div>
+    <article class="metric">
+      <div class="metric-label">服务</div>
+      <div class="metric-value ok">运行中</div>
     </article>
   `;
 
-  tags.innerHTML = ledgers
-    .map((name) => `<span class="tag">${escapeHtml(name)}</span>`)
-    .join("");
+  tags.innerHTML = ledgers.length
+    ? ledgers.map((name) => `<span class="chip">${escapeHtml(name)}</span>`).join("")
+    : `<span class="chip">暂无</span>`;
 }
 
 function renderNodes(data) {
@@ -102,20 +103,17 @@ function renderNodes(data) {
 
   if (nodes.length === 0) {
     wrap.innerHTML = `
-      <div class="empty-state">
-        <div class="icon" aria-hidden="true">◎</div>
-        <h3>还没有上报节点</h3>
-        <p>点击「注册节点」生成 agent token，然后在网关或旁路由上部署 agent。</p>
-      </div>
-    `;
+      <div class="empty">
+        ${EMPTY_ICON}
+        <h3>还没有节点</h3>
+        <p>注册节点并部署 agent 后，上报会出现在这里。</p>
+      </div>`;
     return;
   }
 
   wrap.innerHTML = `
     <table>
-      <thead>
-        <tr><th>节点 ID</th><th>站点 ID</th></tr>
-      </thead>
+      <thead><tr><th>节点</th><th>站点</th></tr></thead>
       <tbody>
         ${nodes
           .map(
@@ -127,20 +125,18 @@ function renderNodes(data) {
           )
           .join("")}
       </tbody>
-    </table>
-  `;
+    </table>`;
 }
 
-function renderEmptyPanel(containerId, title, description) {
+function renderEmptyCard(containerId, title, description) {
   document.getElementById(containerId).innerHTML = `
-    <div class="panel">
-      <div class="empty-state">
-        <div class="icon" aria-hidden="true">…</div>
+    <div class="card">
+      <div class="empty">
+        ${EMPTY_ICON}
         <h3>${escapeHtml(title)}</h3>
         <p>${escapeHtml(description)}</p>
       </div>
-    </div>
-  `;
+    </div>`;
 }
 
 async function loadView(route) {
@@ -151,7 +147,7 @@ async function loadView(route) {
     return false;
   }
   if (!response.ok) {
-    showToast(`加载 ${route} 失败`);
+    showToast("加载失败");
     return true;
   }
   const data = await response.json();
@@ -163,25 +159,13 @@ async function loadView(route) {
       renderNodes(data);
       break;
     case "devices":
-      renderEmptyPanel(
-        "devices-content",
-        "暂无设备数据",
-        "agent 开始上报后，这里会显示各设备的流量增量。"
-      );
+      renderEmptyCard("devices-content", "暂无设备", "agent 上报后会按 IP/MAC 汇总流量。");
       break;
     case "proxy":
-      renderEmptyPanel(
-        "proxy-content",
-        "暂无代理统计",
-        "接入 Mihomo 采集器后，会按 outbound 汇总直连与代理流量。"
-      );
+      renderEmptyCard("proxy-content", "暂无代理统计", "接入 Mihomo 后按 outbound 展示。");
       break;
     case "alerts":
-      renderEmptyPanel(
-        "alerts-content",
-        "暂无告警",
-        "节点离线或用量偏差过大时，告警会出现在这里。"
-      );
+      renderEmptyCard("alerts-content", "暂无告警", "节点离线或偏差过大时会在这里提示。");
       break;
   }
   return true;
@@ -189,9 +173,7 @@ async function loadView(route) {
 
 async function refreshCurrent() {
   await loadView(currentRoute);
-  if (currentRoute !== "overview") {
-    await loadView("overview");
-  }
+  if (currentRoute !== "overview") await loadView("overview");
 }
 
 function startAutoRefresh() {
@@ -229,8 +211,7 @@ async function bootstrap() {
     return;
   }
   setScreen(true);
-  const hash = location.hash.replace("#", "");
-  setRoute(hash || "overview");
+  setRoute(location.hash.replace("#", "") || "overview");
   await loadView(currentRoute);
   startAutoRefresh();
 }
@@ -244,7 +225,7 @@ loginForm.addEventListener("submit", async (event) => {
     body: JSON.stringify({ password }),
   });
   if (!response.ok) {
-    loginError.textContent = "密码不正确，请检查容器日志或 bootstrap 环境变量。";
+    loginError.textContent = "密码不正确";
     loginError.classList.remove("hidden");
     return;
   }
@@ -253,7 +234,6 @@ loginForm.addEventListener("submit", async (event) => {
   setRoute("overview");
   await refreshCurrent();
   startAutoRefresh();
-  showToast("登录成功");
 });
 
 logoutBtn.addEventListener("click", async () => {
@@ -261,18 +241,13 @@ logoutBtn.addEventListener("click", async () => {
   stopAutoRefresh();
   setScreen(false);
   location.hash = "";
-  showToast("已退出登录");
 });
 
-refreshBtn.addEventListener("click", async () => {
-  await refreshCurrent();
-  showToast("已刷新");
-});
+refreshBtn.addEventListener("click", () => refreshCurrent());
 
 window.addEventListener("hashchange", async () => {
-  const route = location.hash.replace("#", "") || "overview";
-  setRoute(route);
-  await loadView(route);
+  setRoute(location.hash.replace("#", "") || "overview");
+  await loadView(currentRoute);
 });
 
 enrollOpenBtn.addEventListener("click", () => {
@@ -280,10 +255,7 @@ enrollOpenBtn.addEventListener("click", () => {
   enrollDialog.showModal();
 });
 
-enrollCancelBtn.addEventListener("click", () => {
-  enrollDialog.close();
-});
-
+enrollCancelBtn.addEventListener("click", () => enrollDialog.close());
 enrollDialog.addEventListener("close", resetEnrollDialog);
 
 enrollForm.addEventListener("submit", async (event) => {
@@ -301,11 +273,8 @@ enrollForm.addEventListener("submit", async (event) => {
   });
 
   if (!response.ok) {
-    const text = await response.text();
     enrollError.textContent =
-      response.status === 409
-        ? "节点 ID 已存在，请换一个名称。"
-        : text || "注册失败，请稍后重试。";
+      response.status === 409 ? "节点 ID 已存在" : "注册失败";
     enrollError.classList.remove("hidden");
     return;
   }
@@ -316,7 +285,7 @@ enrollForm.addEventListener("submit", async (event) => {
   enrollSubmitBtn.textContent = "已生成";
   enrollSubmitBtn.disabled = true;
   await loadView("nodes");
-  showToast(`节点 ${data.node_id} 已注册`);
+  showToast("节点已注册");
 });
 
 copyTokenBtn.addEventListener("click", async () => {
@@ -324,9 +293,9 @@ copyTokenBtn.addEventListener("click", async () => {
   if (!token) return;
   try {
     await navigator.clipboard.writeText(token);
-    showToast("Token 已复制");
+    showToast("已复制");
   } catch {
-    showToast("复制失败，请手动选择复制");
+    showToast("请手动复制");
   }
 });
 

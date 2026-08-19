@@ -3,152 +3,152 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>LanTally · 流量账本</title>
+    <title>LanTally</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div id="login-screen" class="screen hidden" aria-hidden="true">
-      <div class="login-card">
-        <div class="brand">
-          <div class="brand-mark" aria-hidden="true">
-            <span></span><span></span><span></span>
-          </div>
-          <div>
-            <h1>LanTally</h1>
-            <p>家庭网络流量账本</p>
-          </div>
+    <div id="login-screen" class="login-layout hidden" aria-hidden="true">
+      <aside class="login-aside">
+        <div class="login-aside-inner">
+          <p class="login-kicker">自托管 · 只读 · 不改网</p>
+          <h1>把家里各处的流量，收成一本账。</h1>
+          <p class="login-lead">
+            网关和代理上的 agent 定期上报，LanTally 在本地记录直连、代理和倍率估算，方便你对账和排查。
+          </p>
+          <ul class="login-points">
+            <li>数据留在你的 NAS / 容器里</li>
+            <li>不接管 DHCP、不碰防火墙</li>
+            <li>一个端口，内置网页</li>
+          </ul>
         </div>
-        <form id="login-form">
+        <div class="login-grid" aria-hidden="true"></div>
+      </aside>
+      <main class="login-main">
+        <form id="login-form" class="login-form">
+          <div class="login-form-head">
+            <span class="logo-mark">LT</span>
+            <div>
+              <strong>LanTally</strong>
+              <span>登录控制台</span>
+            </div>
+          </div>
           <label for="login-password">管理员密码</label>
           <input
             id="login-password"
             name="password"
             type="password"
             autocomplete="current-password"
-            placeholder="首次启动见容器日志或环境变量"
+            placeholder="首次启动见容器日志"
             required
           />
-          <p id="login-error" class="form-error hidden" role="alert"></p>
-          <button type="submit" class="btn btn-primary">登录</button>
+          <p id="login-error" class="field-error hidden" role="alert"></p>
+          <button type="submit" class="btn btn-primary">进入</button>
         </form>
-        <p class="login-hint">数据留在本机 · 只读观察 · 不改网络</p>
-      </div>
+      </main>
     </div>
 
-    <div id="app-shell" class="shell hidden" aria-hidden="true">
-      <aside class="sidebar">
-        <div class="sidebar-brand">
-          <div class="brand-mark sm" aria-hidden="true"><span></span><span></span><span></span></div>
-          <div>
-            <strong>LanTally</strong>
-            <span>v0.1</span>
-          </div>
+    <div id="app-shell" class="app hidden" aria-hidden="true">
+      <header class="app-header">
+        <div class="header-left">
+          <span class="logo-mark sm">LT</span>
+          <span class="logo-text">LanTally</span>
         </div>
-        <nav class="sidebar-nav" aria-label="主导航">
-          <a href="#overview" data-route="overview" class="nav-link active">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9zm0 7h6v-5H4v5zm8 0h8v-9h-8v9zm0-16v5h8V4h-8z"/></svg>
-            概览
-          </a>
-          <a href="#nodes" data-route="nodes" class="nav-link">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v4H4V6zm0 8h16v4H4v-4z"/></svg>
-            节点
-          </a>
-          <a href="#devices" data-route="devices" class="nav-link">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm0 4v12h10V6H7z"/></svg>
-            设备
-          </a>
-          <a href="#proxy" data-route="proxy" class="nav-link">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 2 7l10 5 10-5-10-5zm0 8L2 5v12l10 5 10-5V5l-10 5z"/></svg>
-            代理
-          </a>
-          <a href="#alerts" data-route="alerts" class="nav-link">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2 2 0 0 0 2-2H10a2 2 0 0 0 2 2zm6-6V11a6 6 0 1 0-12 0v5l-2 2v1h16v-1l-2-2z"/></svg>
-            告警
-          </a>
+        <nav class="header-nav" aria-label="主导航">
+          <a href="#overview" data-route="overview" class="nav-item active">概览</a>
+          <a href="#nodes" data-route="nodes" class="nav-item">节点</a>
+          <a href="#devices" data-route="devices" class="nav-item">设备</a>
+          <a href="#proxy" data-route="proxy" class="nav-item">代理</a>
+          <a href="#alerts" data-route="alerts" class="nav-item">告警</a>
         </nav>
-        <button type="button" id="logout-btn" class="btn btn-ghost sidebar-logout">退出登录</button>
-      </aside>
+        <div class="header-right">
+          <button type="button" id="refresh-btn" class="btn btn-text">刷新</button>
+          <button type="button" id="logout-btn" class="btn btn-text muted">退出</button>
+        </div>
+      </header>
 
-      <div class="main">
-        <header class="topbar">
+      <main class="app-main">
+        <header class="page-header">
           <div>
-            <p class="eyebrow" id="page-eyebrow">Dashboard</p>
+            <p class="page-kicker" id="page-eyebrow">Dashboard</p>
             <h2 id="page-title">概览</h2>
           </div>
-          <button type="button" id="refresh-btn" class="btn btn-ghost" title="刷新数据">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 12.65-5.65z"/></svg>
-            刷新
-          </button>
         </header>
 
-        <section id="view-overview" class="view active" data-view="overview">
-          <div class="stat-grid" id="overview-stats"></div>
-          <div class="panel">
-            <div class="panel-head">
-              <h3>账本类型</h3>
-              <span class="badge">v0.1</span>
+        <section id="view-overview" class="page view active" data-view="overview">
+          <div class="metrics" id="overview-stats"></div>
+          <div class="card">
+            <div class="card-header">
+              <h3>账本维度</h3>
             </div>
-            <div id="ledger-tags" class="tag-row"></div>
+            <div id="ledger-tags" class="chip-list"></div>
           </div>
         </section>
 
-        <section id="view-nodes" class="view" data-view="nodes">
-          <div class="panel">
-            <div class="panel-head">
-              <h3>上报节点</h3>
+        <section id="view-nodes" class="page view" data-view="nodes">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>上报节点</h3>
+                <p class="card-sub">在网关或旁路由部署 agent 后出现在此</p>
+              </div>
               <button type="button" id="enroll-open-btn" class="btn btn-primary btn-sm">注册节点</button>
             </div>
-            <div id="nodes-table-wrap" class="table-wrap"></div>
+            <div id="nodes-table-wrap"></div>
           </div>
         </section>
 
-        <section id="view-devices" class="view" data-view="devices">
+        <section id="view-devices" class="page view" data-view="devices">
           <div id="devices-content"></div>
         </section>
 
-        <section id="view-proxy" class="view" data-view="proxy">
+        <section id="view-proxy" class="page view" data-view="proxy">
           <div id="proxy-content"></div>
         </section>
 
-        <section id="view-alerts" class="view" data-view="alerts">
+        <section id="view-alerts" class="page view" data-view="alerts">
           <div id="alerts-content"></div>
         </section>
-      </div>
+      </main>
     </div>
 
-    <dialog id="enroll-dialog" class="dialog">
+    <dialog id="enroll-dialog" class="modal">
       <form id="enroll-form" method="dialog">
-        <header>
-          <h3>注册新节点</h3>
-          <p>生成 agent 凭据，明文 token 只显示一次。</p>
-        </header>
-        <label for="enroll-site">站点 ID</label>
-        <input id="enroll-site" name="site_id" required placeholder="home" />
-        <label for="enroll-node">节点 ID</label>
-        <input id="enroll-node" name="node_id" required placeholder="proxy-20" />
-        <p id="enroll-error" class="form-error hidden" role="alert"></p>
-        <div id="enroll-result" class="enroll-result hidden">
-          <label>Agent Token（请立即复制保存）</label>
-          <div class="token-box">
-            <code id="enroll-token"></code>
-            <button type="button" id="copy-token-btn" class="btn btn-ghost btn-sm">复制</button>
+        <div class="modal-header">
+          <h3>注册节点</h3>
+          <button type="button" id="enroll-cancel-btn" class="btn-icon" aria-label="关闭">×</button>
+        </div>
+        <p class="modal-lead">生成 agent 凭据。Token 明文只显示一次，请立即保存。</p>
+        <div class="field-row">
+          <div class="field">
+            <label for="enroll-site">站点 ID</label>
+            <input id="enroll-site" name="site_id" required placeholder="home" />
+          </div>
+          <div class="field">
+            <label for="enroll-node">节点 ID</label>
+            <input id="enroll-node" name="node_id" required placeholder="proxy-20" />
           </div>
         </div>
-        <footer>
-          <button type="button" id="enroll-cancel-btn" class="btn btn-ghost" value="cancel">关闭</button>
+        <p id="enroll-error" class="field-error hidden" role="alert"></p>
+        <div id="enroll-result" class="token-panel hidden">
+          <label>Agent Token</label>
+          <div class="token-row">
+            <code id="enroll-token"></code>
+            <button type="button" id="copy-token-btn" class="btn btn-secondary btn-sm">复制</button>
+          </div>
+        </div>
+        <div class="modal-footer">
           <button type="submit" id="enroll-submit-btn" class="btn btn-primary">生成 Token</button>
-        </footer>
+        </div>
       </form>
     </dialog>
 
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
-
     <script src="/app.js"></script>
   </body>
 </html>
