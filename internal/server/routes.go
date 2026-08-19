@@ -8,9 +8,12 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/misakayyds/lantally/internal/enroll"
 	"github.com/misakayyds/lantally/internal/ingest"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
 )
@@ -54,6 +57,7 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("POST /v1/ingest", ingestHandler.Ingest)
 	mux.HandleFunc("GET /healthz", ingestHandler.Healthz)
 	mux.HandleFunc("POST /v1/login", loginHandler(store, sessions))
+	mux.HandleFunc("POST /v1/enroll", requireSession(sessions, enrollHandler(store)))
 	mux.HandleFunc("GET /v1/overview", requireSession(sessions, overviewHandler(store)))
 	mux.HandleFunc("GET /v1/devices", requireSession(sessions, emptyListHandler("devices")))
 	mux.HandleFunc("GET /v1/nodes", requireSession(sessions, nodesHandler(store)))
@@ -107,6 +111,47 @@ func loginHandler(store *sqlitestore.Store, sessions *sessionStore) http.Handler
 	}
 }
 
+func enrollHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SiteID string `json:"site_id"`
+			NodeID string `json:"node_id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid enroll request", http.StatusBadRequest)
+			return
+		}
+		body.SiteID = strings.TrimSpace(body.SiteID)
+		body.NodeID = strings.TrimSpace(body.NodeID)
+		if body.SiteID == "" || body.NodeID == "" {
+			http.Error(w, "site_id and node_id are required", http.StatusBadRequest)
+			return
+		}
+		token, credentialID, err := enroll.IssueToken()
+		if err != nil {
+			http.Error(w, "token unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := store.CreateNode(
+			r.Context(),
+			body.NodeID,
+			body.SiteID,
+			credentialID,
+			enroll.HashToken(token),
+		); err != nil {
+			http.Error(w, "enroll failed", http.StatusConflict)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"site_id": body.SiteID,
+			"node_id": body.NodeID,
+			"token":   token,
+		})
+	}
+}
+
 func overviewHandler(store *sqlitestore.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		count, err := store.BatchCount(r.Context())
@@ -123,7 +168,15 @@ func overviewHandler(store *sqlitestore.Store) http.HandlerFunc {
 
 func nodesHandler(store *sqlitestore.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []any{}})
+		nodes, err := store.ListNodes(r.Context())
+		if err != nil {
+			http.Error(w, "nodes unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if nodes == nil {
+			nodes = []sqlitestore.Node{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": nodes})
 	}
 }
 
@@ -134,6 +187,8 @@ func emptyListHandler(name string) http.HandlerFunc {
 }
 
 // EnsureFirstRunAdmin creates a one-time admin password when none exists.
+// If LANTALLY_BOOTSTRAP_ADMIN_PASSWORD is set and no admin exists yet, that
+// value is used instead of generating a random password.
 func EnsureFirstRunAdmin(store *sqlitestore.Store, stdout io.Writer) error {
 	hasAdmin, err := store.HasAdminCredential()
 	if err != nil {
@@ -142,16 +197,39 @@ func EnsureFirstRunAdmin(store *sqlitestore.Store, stdout io.Writer) error {
 	if hasAdmin {
 		return nil
 	}
-	password, err := sqlitestore.GenerateAdminPassword()
+	password, err := bootstrapAdminPassword()
 	if err != nil {
 		return err
 	}
-	if err := store.CreateAdminCredential(password); err != nil {
+	if err := store.CreateAdminCredential(password.value); err != nil {
+		return err
+	}
+	if password.fromEnv {
+		if stdout == nil {
+			stdout = io.Discard
+		}
+		_, err = fmt.Fprintln(stdout, "LanTally admin password loaded from LANTALLY_BOOTSTRAP_ADMIN_PASSWORD")
 		return err
 	}
 	if stdout == nil {
 		stdout = io.Discard
 	}
-	_, err = fmt.Fprintf(stdout, "LanTally admin password (shown once): %s\n", password)
+	_, err = fmt.Fprintf(stdout, "LanTally admin password (shown once): %s\n", password.value)
 	return err
+}
+
+type adminPassword struct {
+	value   string
+	fromEnv bool
+}
+
+func bootstrapAdminPassword() (adminPassword, error) {
+	if envPassword := strings.TrimSpace(os.Getenv("LANTALLY_BOOTSTRAP_ADMIN_PASSWORD")); envPassword != "" {
+		return adminPassword{value: envPassword, fromEnv: true}, nil
+	}
+	generated, err := sqlitestore.GenerateAdminPassword()
+	if err != nil {
+		return adminPassword{}, err
+	}
+	return adminPassword{value: generated, fromEnv: false}, nil
 }

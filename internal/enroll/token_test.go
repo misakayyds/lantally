@@ -23,6 +23,20 @@ func TestHashTokenUsesSaltAndVerifies(t *testing.T) {
 	}
 }
 
+func TestIssueTokenRoundTripsCredentialID(t *testing.T) {
+	token, credentialID, err := IssueToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, ok := CredentialID(token)
+	if !ok || parsed != credentialID {
+		t.Fatalf("CredentialID(%q) = %q, %v; want %q", token, parsed, ok, credentialID)
+	}
+	if !VerifyToken(token, HashToken(token)) {
+		t.Fatal("issued token did not verify")
+	}
+}
+
 func TestCredentialIDParsesPublicTokenIdentifier(t *testing.T) {
 	token := "lt_cred-a_" + strings.Repeat("a", 32)
 	id, ok := CredentialID(token)

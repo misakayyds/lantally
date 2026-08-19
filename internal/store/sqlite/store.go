@@ -157,6 +157,24 @@ func (s *Store) CreateNode(
 	return err
 }
 
+func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id FROM nodes WHERE revoked = 0 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var nodes []Node
+	for rows.Next() {
+		var node Node
+		if err := rows.Scan(&node.ID, &node.SiteID); err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, rows.Err()
+}
+
 func (s *Store) RevokeNode(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET revoked = 1 WHERE id = ?`, id)
 	return err

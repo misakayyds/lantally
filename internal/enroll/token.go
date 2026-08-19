@@ -3,6 +3,8 @@ package enroll
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
+	"fmt"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -35,6 +37,21 @@ func VerifyToken(token string, stored []byte) bool {
 	want := stored[saltLength:]
 	got := argon2.IDKey([]byte(token), salt, argonTime, argonMemory, argonThreads, hashLength)
 	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// IssueToken creates a one-time bearer token of the form lt_<credential_id>_<secret>.
+func IssueToken() (token, credentialID string, err error) {
+	var cred [8]byte
+	var secret [24]byte
+	if _, err := rand.Read(cred[:]); err != nil {
+		return "", "", fmt.Errorf("generate credential id: %w", err)
+	}
+	if _, err := rand.Read(secret[:]); err != nil {
+		return "", "", fmt.Errorf("generate token secret: %w", err)
+	}
+	credentialID = hex.EncodeToString(cred[:])
+	token = "lt_" + credentialID + "_" + hex.EncodeToString(secret[:])
+	return token, credentialID, nil
 }
 
 // CredentialID extracts the non-secret lookup identifier from a bearer token.
