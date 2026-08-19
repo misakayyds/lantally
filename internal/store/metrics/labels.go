@@ -18,6 +18,8 @@ var forbiddenLabels = map[string]bool{
 	"domain":      true,
 	"url":         true,
 	"conn_id":     true,
+	"source_ip":   true,
+	"sourceip":    true,
 }
 
 // ValidateLabels rejects privacy-sensitive or unknown metric labels.

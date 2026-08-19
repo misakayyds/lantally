@@ -118,7 +118,22 @@ func applyMigrations(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(string(sampleMigration))
+	if _, err := db.Exec(string(sampleMigration)); err != nil {
+		return err
+	}
+
+	hasOutbound, err := tableHasColumn(db, "ledger_totals", "outbound")
+	if err != nil {
+		return err
+	}
+	if hasOutbound {
+		return nil
+	}
+	outboundMigration, err := migrations.ReadFile("migrations/0007_ledger_outbound.sql")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(string(outboundMigration))
 	return err
 }
 

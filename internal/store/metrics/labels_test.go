@@ -3,7 +3,7 @@ package metrics
 import "testing"
 
 func TestValidateLabelsRejectsForbiddenDimensions(t *testing.T) {
-	for _, label := range []string{"destination", "domain", "url", "conn_id"} {
+	for _, label := range []string{"destination", "domain", "url", "conn_id", "source_ip", "sourceIP"} {
 		err := ValidateLabels(map[string]string{label: "value"})
 		if err == nil {
 			t.Fatalf("expected forbidden label %q to fail", label)

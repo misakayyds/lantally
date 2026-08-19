@@ -21,6 +21,8 @@ Adding these sources together would double-count. Guessing an unknown node multi
 - A multiplier applies only when the outbound or policy name matches configuration. Otherwise the series is `proxy_unadjusted` and the UI marks it. Do not default to `1.0`.
 - Provider checkpoints are manually entered or imported counters, not scraped billing portals.
 - Drift is `|adjusted - provider| / provider` when provider > 0. The 10% target for a disclosed fixed multiplier is a reporting goal, not a reason to rewrite stored series.
+- `proxy_raw` / `proxy_adjusted` / `proxy_unadjusted` are stored per outbound name. Empty `outbound` means the row is not split (used by `total` and `direct`). Summing outbound rows of one class equals that class's node total. Outbound names never participate in `total` source selection and are never added to nlbwmon or iface bytes.
+- Mihomo `metadata.sourceIP` may attribute proxy/direct bytes to a device only when the address is loopback, link-local, or RFC1918/ULA. Missing or public source IPs stay node-level. Source IPs are not metric labels.
 
 ## Consequences
 

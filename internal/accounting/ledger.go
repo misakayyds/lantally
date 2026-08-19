@@ -14,6 +14,7 @@ const (
 type Increment struct {
 	DeviceID string
 	Class    string
+	Outbound string
 	Rx       uint64
 	Tx       uint64
 }
@@ -33,20 +34,11 @@ func NodeIncrements(batch protocol.Batch, multipliers map[string]float64) []Incr
 	}
 
 	if batch.Proxy != nil {
-		directRx, directTx, proxyRx, proxyTx := proxyTotals(batch.Proxy)
+		directRx, directTx, _, _ := proxyTotals(batch.Proxy)
 		if directRx+directTx > 0 {
 			out = append(out, Increment{Class: ClassDirect, Rx: directRx, Tx: directTx})
 		}
-		if proxyRx+proxyTx > 0 {
-			out = append(out, Increment{Class: ClassProxyRaw, Rx: proxyRx, Tx: proxyTx})
-		}
-		adjustedRx, adjustedTx, unadjRx, unadjTx := proxyAdjusted(batch.Proxy, multipliers)
-		if adjustedRx+adjustedTx > 0 {
-			out = append(out, Increment{Class: ClassProxyAdjusted, Rx: adjustedRx, Tx: adjustedTx})
-		}
-		if unadjRx+unadjTx > 0 {
-			out = append(out, Increment{Class: ClassProxyUnadjusted, Rx: unadjRx, Tx: unadjTx})
-		}
+		out = append(out, proxyIncrements(batch.Proxy, multipliers)...)
 	}
 	return compactIncrements(out)
 }
@@ -61,10 +53,61 @@ func DeviceIncrements(obs protocol.DeviceDelta, deviceID string, multipliers map
 	case protocol.SourceNlbwmon:
 		return []Increment{{DeviceID: deviceID, Class: ClassTotal, Rx: obs.RxDelta, Tx: obs.TxDelta}}
 	case protocol.SourceMihomo:
-		return []Increment{{DeviceID: deviceID, Class: ClassProxyRaw, Rx: obs.RxDelta, Tx: obs.TxDelta}}
+		if obs.Outbound == "DIRECT" {
+			return []Increment{{DeviceID: deviceID, Class: ClassDirect, Rx: obs.RxDelta, Tx: obs.TxDelta}}
+		}
+		return []Increment{{
+			DeviceID: deviceID,
+			Class:    ClassProxyRaw,
+			Outbound: obs.Outbound,
+			Rx:       obs.RxDelta,
+			Tx:       obs.TxDelta,
+		}}
 	default:
 		return nil
 	}
+}
+
+func proxyIncrements(proxy *protocol.ProxyDelta, multipliers map[string]float64) []Increment {
+	if proxy == nil {
+		return nil
+	}
+	var out []Increment
+	for _, outbound := range proxy.ByOutbound {
+		if outbound.Name == "DIRECT" {
+			continue
+		}
+		if outbound.ProxyRx+outbound.ProxyTx > 0 {
+			out = append(out, Increment{
+				Class:    ClassProxyRaw,
+				Outbound: outbound.Name,
+				Rx:       outbound.ProxyRx,
+				Tx:       outbound.ProxyTx,
+			})
+		}
+		rx, unadjRx := ApplyMultiplier(outbound.ProxyRx, outbound.Name, multipliers)
+		tx, unadjTx := ApplyMultiplier(outbound.ProxyTx, outbound.Name, multipliers)
+		if unadjRx || unadjTx || outbound.Unadjusted {
+			if outbound.ProxyRx+outbound.ProxyTx > 0 {
+				out = append(out, Increment{
+					Class:    ClassProxyUnadjusted,
+					Outbound: outbound.Name,
+					Rx:       outbound.ProxyRx,
+					Tx:       outbound.ProxyTx,
+				})
+			}
+			continue
+		}
+		if rx+tx > 0 {
+			out = append(out, Increment{
+				Class:    ClassProxyAdjusted,
+				Outbound: outbound.Name,
+				Rx:       rx,
+				Tx:       tx,
+			})
+		}
+	}
+	return out
 }
 
 func nlbwmonTotals(devices []protocol.DeviceDelta) (rx, tx uint64, ok bool) {
@@ -101,24 +144,6 @@ func proxyTotals(proxy *protocol.ProxyDelta) (directRx, directTx, proxyRx, proxy
 		proxyTx += outbound.ProxyTx
 	}
 	return directRx, directTx, proxyRx, proxyTx
-}
-
-func proxyAdjusted(proxy *protocol.ProxyDelta, multipliers map[string]float64) (adjRx, adjTx, unadjRx, unadjTx uint64) {
-	if proxy == nil {
-		return 0, 0, 0, 0
-	}
-	for _, outbound := range proxy.ByOutbound {
-		rx, unadj := ApplyMultiplier(outbound.ProxyRx, outbound.Name, multipliers)
-		tx, unadjTxFlag := ApplyMultiplier(outbound.ProxyTx, outbound.Name, multipliers)
-		if unadj || unadjTxFlag || outbound.Unadjusted {
-			unadjRx += outbound.ProxyRx
-			unadjTx += outbound.ProxyTx
-			continue
-		}
-		adjRx += rx
-		adjTx += tx
-	}
-	return adjRx, adjTx, unadjRx, unadjTx
 }
 
 func compactIncrements(items []Increment) []Increment {

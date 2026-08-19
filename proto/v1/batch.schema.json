@@ -111,6 +111,9 @@
         "source": {
           "type": "string",
           "enum": ["nlbwmon", "mihomo", "neigh"]
+        },
+        "outbound": {
+          "type": "string"
         }
       },
       "additionalProperties": false

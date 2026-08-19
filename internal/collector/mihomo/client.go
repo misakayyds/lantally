@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -27,10 +28,15 @@ type connectionsResponse struct {
 }
 
 type connectionRecord struct {
-	ID       string   `json:"id"`
-	Upload   uint64   `json:"upload"`
-	Download uint64   `json:"download"`
-	Chains   []string `json:"chains"`
+	ID       string             `json:"id"`
+	Upload   uint64             `json:"upload"`
+	Download uint64             `json:"download"`
+	Chains   []string           `json:"chains"`
+	Metadata connectionMetadata `json:"metadata"`
+}
+
+type connectionMetadata struct {
+	SourceIP string `json:"sourceIP"`
 }
 
 // ParseConnections converts Mihomo /connections JSON into proxy outbound deltas.
@@ -38,14 +44,15 @@ type connectionRecord struct {
 func ParseConnections(
 	prev map[string]ConnCounters,
 	raw []byte,
-) (protocol.ProxyDelta, map[string]ConnCounters, []protocol.Gap, error) {
+) (protocol.ProxyDelta, []protocol.DeviceDelta, map[string]ConnCounters, []protocol.Gap, error) {
 	var response connectionsResponse
 	if err := json.Unmarshal(raw, &response); err != nil {
-		return protocol.ProxyDelta{}, nil, nil, fmt.Errorf("decode mihomo connections: %w", err)
+		return protocol.ProxyDelta{}, nil, nil, nil, fmt.Errorf("decode mihomo connections: %w", err)
 	}
 
 	next := make(map[string]ConnCounters, len(response.Connections))
 	byOutbound := make(map[string]*protocol.OutboundDelta)
+	byDevice := make(map[deviceKey]*protocol.DeviceDelta)
 	now := time.Now().UTC()
 
 	for _, record := range response.Connections {
@@ -76,6 +83,20 @@ func ParseConnections(
 			entry.ProxyTx += uploadDelta
 			entry.ProxyRx += downloadDelta
 		}
+		if sourceIP, ok := lanSourceIP(record.Metadata.SourceIP); ok {
+			key := deviceKey{ip: sourceIP, outbound: outbound}
+			device := byDevice[key]
+			if device == nil {
+				device = &protocol.DeviceDelta{
+					ObsIP:    sourceIP,
+					Source:   protocol.SourceMihomo,
+					Outbound: outbound,
+				}
+				byDevice[key] = device
+			}
+			device.TxDelta += uploadDelta
+			device.RxDelta += downloadDelta
+		}
 	}
 
 	var gaps []protocol.Gap
@@ -94,7 +115,27 @@ func ParseConnections(
 	for _, entry := range byOutbound {
 		result.ByOutbound = append(result.ByOutbound, *entry)
 	}
-	return result, next, gaps, nil
+	devices := make([]protocol.DeviceDelta, 0, len(byDevice))
+	for _, device := range byDevice {
+		devices = append(devices, *device)
+	}
+	return result, devices, next, gaps, nil
+}
+
+type deviceKey struct {
+	ip       string
+	outbound string
+}
+
+func lanSourceIP(raw string) (string, bool) {
+	parsed := net.ParseIP(strings.TrimSpace(raw))
+	if parsed == nil {
+		return "", false
+	}
+	if parsed.IsPrivate() || parsed.IsLoopback() || parsed.IsLinkLocalUnicast() {
+		return parsed.String(), true
+	}
+	return "", false
 }
 
 func outboundName(chains []string) string {
@@ -167,17 +208,17 @@ func (c *Collector) Capability() protocol.Capability {
 func (c *Collector) Collect(
 	ctx context.Context,
 	at time.Time,
-) (*protocol.ProxyDelta, []protocol.Gap, error) {
+) (*protocol.ProxyDelta, []protocol.DeviceDelta, []protocol.Gap, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	raw, err := c.client.FetchConnections(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	delta, next, gaps, err := ParseConnections(c.prev, raw)
+	delta, devices, next, gaps, err := ParseConnections(c.prev, raw)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for i := range gaps {
 		gaps[i].From = at.Add(-time.Second)
@@ -185,7 +226,7 @@ func (c *Collector) Collect(
 	}
 	c.prev = next
 	if len(delta.ByOutbound) == 0 {
-		return nil, gaps, nil
+		return nil, devices, gaps, nil
 	}
-	return &delta, gaps, nil
+	return &delta, devices, gaps, nil
 }

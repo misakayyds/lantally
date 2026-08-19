@@ -53,11 +53,12 @@ const (
 )
 
 type DeviceDelta struct {
-	ObsIP   string       `json:"obs_ip"`
-	ObsMAC  string       `json:"obs_mac,omitempty"`
-	RxDelta uint64       `json:"rx_delta"`
-	TxDelta uint64       `json:"tx_delta"`
-	Source  DeviceSource `json:"source"`
+	ObsIP    string       `json:"obs_ip"`
+	ObsMAC   string       `json:"obs_mac,omitempty"`
+	RxDelta  uint64       `json:"rx_delta"`
+	TxDelta  uint64       `json:"tx_delta"`
+	Source   DeviceSource `json:"source"`
+	Outbound string       `json:"outbound,omitempty"`
 }
 
 type ProxyDelta struct {

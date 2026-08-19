@@ -20,6 +20,7 @@ import (
 
 	ifacecollector "github.com/misakayyds/lantally/internal/collector/iface"
 	mihomocollector "github.com/misakayyds/lantally/internal/collector/mihomo"
+	nlbwmoncollector "github.com/misakayyds/lantally/internal/collector/nlbwmon"
 	"github.com/misakayyds/lantally/internal/protocol"
 )
 
@@ -35,12 +36,16 @@ type Config struct {
 	TokenFile  string
 	Interval   time.Duration
 	Collectors struct {
-		Iface  bool
-		Mihomo bool
+		Iface   bool
+		Mihomo  bool
+		Nlbwmon bool
 	}
 	Mihomo struct {
 		URL        string
 		SecretFile string
+	}
+	Nlbwmon struct {
+		Command string
 	}
 }
 
@@ -51,13 +56,17 @@ type configFile struct {
 	TokenFile  string `json:"token_file"`
 	Interval   string `json:"interval"`
 	Collectors struct {
-		Iface  bool `json:"iface"`
-		Mihomo bool `json:"mihomo"`
+		Iface   bool `json:"iface"`
+		Mihomo  bool `json:"mihomo"`
+		Nlbwmon bool `json:"nlbwmon"`
 	} `json:"collectors"`
 	Mihomo struct {
 		URL        string `json:"url"`
 		SecretFile string `json:"secret_file"`
 	} `json:"mihomo"`
+	Nlbwmon struct {
+		Command string `json:"command"`
+	} `json:"nlbwmon"`
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -90,8 +99,10 @@ func LoadConfig(filename string) (Config, error) {
 	}
 	cfg.Collectors.Iface = raw.Collectors.Iface
 	cfg.Collectors.Mihomo = raw.Collectors.Mihomo
+	cfg.Collectors.Nlbwmon = raw.Collectors.Nlbwmon
 	cfg.Mihomo.URL = strings.TrimSpace(raw.Mihomo.URL)
 	cfg.Mihomo.SecretFile = strings.TrimSpace(raw.Mihomo.SecretFile)
+	cfg.Nlbwmon.Command = strings.TrimSpace(raw.Nlbwmon.Command)
 	if cfg.ServerURL == "" || cfg.SiteID == "" || cfg.NodeID == "" || cfg.TokenFile == "" {
 		return Config{}, errors.New("server_url, site_id, node_id, and token_file are required")
 	}
@@ -187,6 +198,10 @@ func newAgent(config Config, bootID string, available map[string]collector) *age
 			if !config.Collectors.Mihomo {
 				continue
 			}
+		case "nlbwmon":
+			if !config.Collectors.Nlbwmon {
+				continue
+			}
 		}
 		a.collectors = append(a.collectors, namedCollector{name: name, collector: candidate})
 	}
@@ -217,6 +232,22 @@ func (a ifaceAdapter) Collect(ctx context.Context, at time.Time) (snapshot, erro
 	return snapshot{interfaces: deltas, gaps: gaps}, nil
 }
 
+type nlbwmonAdapter struct {
+	inner *nlbwmoncollector.Collector
+}
+
+func (a nlbwmonAdapter) Capability() protocol.Capability {
+	return a.inner.Capability()
+}
+
+func (a nlbwmonAdapter) Collect(ctx context.Context, at time.Time) (snapshot, error) {
+	devices, gaps, err := a.inner.Collect(ctx, at)
+	if err != nil {
+		return snapshot{}, err
+	}
+	return snapshot{devices: devices, gaps: gaps}, nil
+}
+
 type mihomoAdapter struct {
 	inner *mihomocollector.Collector
 }
@@ -226,11 +257,11 @@ func (a mihomoAdapter) Capability() protocol.Capability {
 }
 
 func (a mihomoAdapter) Collect(ctx context.Context, at time.Time) (snapshot, error) {
-	proxy, gaps, err := a.inner.Collect(ctx, at)
+	proxy, devices, gaps, err := a.inner.Collect(ctx, at)
 	if err != nil {
 		return snapshot{}, err
 	}
-	return snapshot{proxy: proxy, gaps: gaps}, nil
+	return snapshot{devices: devices, proxy: proxy, gaps: gaps}, nil
 }
 
 func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
@@ -455,6 +486,15 @@ func run(ctx context.Context, cfg Config, token string) error {
 		}
 		available["mihomo"] = mihomoAdapter{
 			inner: mihomocollector.NewCollector(mihomocollector.NewClient(cfg.Mihomo.URL, secret, nil)),
+		}
+	}
+	if cfg.Collectors.Nlbwmon {
+		command := cfg.Nlbwmon.Command
+		if command == "" {
+			command = "/usr/sbin/nlbw"
+		}
+		available["nlbwmon"] = nlbwmonAdapter{
+			inner: nlbwmoncollector.NewCollector(nlbwmoncollector.CommandDump(command, "-c", "json")),
 		}
 	}
 	a, err := newAgentSession(cfg, available)

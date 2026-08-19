@@ -63,14 +63,15 @@ func (s *Store) ApplyLedgerOnce(
 		}
 		_, err = tx.ExecContext(
 			ctx,
-			`INSERT INTO ledger_totals (site_id, node_id, device_id, class, rx, tx)
-			 VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(site_id, node_id, device_id, class)
+			`INSERT INTO ledger_totals (site_id, node_id, device_id, class, outbound, rx, tx)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(site_id, node_id, device_id, class, outbound)
 			 DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx`,
 			siteID,
 			nodeID,
 			item.DeviceID,
 			item.Class,
+			item.Outbound,
 			int64(item.Rx),
 			int64(item.Tx),
 		)
@@ -79,13 +80,14 @@ func (s *Store) ApplyLedgerOnce(
 		}
 		_, err = tx.ExecContext(
 			ctx,
-			`INSERT INTO ledger_samples (sampled_at, site_id, node_id, device_id, class, rx, tx)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO ledger_samples (sampled_at, site_id, node_id, device_id, class, outbound, rx, tx)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			sampledUnix,
 			siteID,
 			nodeID,
 			item.DeviceID,
 			item.Class,
+			item.Outbound,
 			int64(item.Rx),
 			int64(item.Tx),
 		)
@@ -117,9 +119,10 @@ func (s *Store) LedgerTotals(ctx context.Context) (map[string]uint64, error) {
 func (s *Store) NodeLedgerTotals(ctx context.Context, siteID, nodeID string) (map[string]uint64, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT class, rx + tx
+		`SELECT class, SUM(rx) + SUM(tx)
 		 FROM ledger_totals
-		 WHERE site_id = ? AND node_id = ? AND device_id = ''`,
+		 WHERE site_id = ? AND node_id = ? AND device_id = ''
+		 GROUP BY class`,
 		siteID,
 		nodeID,
 	)
@@ -234,10 +237,14 @@ func (s *Store) TrafficSeries(ctx context.Context, query TrafficQuery) (TrafficS
 	fromUnix := query.From.UTC().Unix()
 	toUnix := query.To.UTC().Unix()
 	args := []any{query.BucketSeconds, query.BucketSeconds, query.Class, fromUnix, toUnix}
-	if query.Group == "class" {
+	switch query.Group {
+	case "class":
 		keyExpr = "class"
 		whereClass = `class IN ('direct', 'proxy_raw', 'proxy_adjusted', 'proxy_unadjusted')`
 		args = []any{query.BucketSeconds, query.BucketSeconds, fromUnix, toUnix}
+	case "outbound":
+		keyExpr = "outbound"
+		whereClass = `class = ? AND outbound != ''`
 	}
 
 	rows, err := s.db.QueryContext(
@@ -245,7 +252,7 @@ func (s *Store) TrafficSeries(ctx context.Context, query TrafficQuery) (TrafficS
 		`SELECT (sampled_at / ?) * ? AS bucket, `+keyExpr+`, SUM(rx + tx)
 		 FROM ledger_samples
 		 WHERE device_id = '' AND `+whereClass+`
-		   AND sampled_at >= ? AND sampled_at < ?
+		   AND sampled_at >= ? AND sampled_at <= ?
 		 GROUP BY bucket, `+keyExpr+`
 		 ORDER BY bucket, `+keyExpr,
 		args...,

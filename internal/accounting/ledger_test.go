@@ -15,6 +15,7 @@ func TestNodeIncrementsPrefersNlbwmonOverIfaceAndMihomo(t *testing.T) {
 		Devices: []protocol.DeviceDelta{
 			{ObsIP: "203.0.113.1", ObsMAC: "02:00:00:00:00:01", RxDelta: 50, TxDelta: 10, Source: protocol.SourceNlbwmon},
 			{ObsIP: "203.0.113.2", ObsMAC: "02:00:00:00:00:02", RxDelta: 25, TxDelta: 5, Source: protocol.SourceNlbwmon},
+			{ObsIP: "192.168.0.10", RxDelta: 999, TxDelta: 1, Source: protocol.SourceMihomo, Outbound: "proxy-a"},
 		},
 		Proxy: &protocol.ProxyDelta{
 			ByOutbound: []protocol.OutboundDelta{
@@ -168,4 +169,23 @@ func classTotals(increments []Increment) map[string]uint64 {
 		out[item.Class] += item.Rx + item.Tx
 	}
 	return out
+}
+
+func outboundTotals(increments []Increment, class string) map[string]uint64 {
+	out := map[string]uint64{}
+	for _, item := range increments {
+		if item.DeviceID != "" || item.Class != class {
+			continue
+		}
+		out[item.Outbound] += item.Rx + item.Tx
+	}
+	return out
+}
+
+func sumMap(values map[string]uint64) uint64 {
+	var sum uint64
+	for _, value := range values {
+		sum += value
+	}
+	return sum
 }

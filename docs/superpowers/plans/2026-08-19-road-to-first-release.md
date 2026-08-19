@@ -1,6 +1,6 @@
 # LanTally 首个可发布版本（v0.1.0）规划
 
-> 状态：规划文档，未开始实现。本文只定义范围、顺序和验收标准，不改任何代码。
+> 状态：R1 已在 `feat/r1-outbound-device-ledgers` 落地（outbound 账本、Mihomo sourceIP 设备归因、nlbwmon 接入 agent 且默认关）。R2–R7 未开始。
 > 前置：M1–M9 已在 `main` 落地（注册、摄入、身份、账本、Mihomo 采集、嵌入式 UI、72 小时堆叠图、all-in-one 打包）。
 > 本文接替原计划的 M10，展开为 R1–R7。执行时逐个里程碑拆 TDD 步骤。
 
@@ -25,11 +25,11 @@
 | --- | --- |
 | 节点注册 / token / 撤销 | 后端有，UI 只有注册；撤销无入口 |
 | 摄入去重 / 断点重试 / 缺口记录 | 完成 |
-| iface / nlbwmon / Mihomo 采集 | iface、Mihomo 已接 agent；nlbwmon 解析器完成但未接 agent 主路径 |
-| 账本（total/direct/proxy_*） | 完成，含 30 分钟粒度 `ledger_samples` |
+| iface / nlbwmon / Mihomo 采集 | iface、Mihomo 已接 agent；nlbwmon 已接 agent，`collectors.nlbwmon` 默认关 |
+| 账本（total/direct/proxy_*） | 完成，含 30 分钟粒度 `ledger_samples` 和 `outbound` 列 |
 | 72 小时堆叠图 | 完成（概览按节点、代理页按类别） |
-| 按设备记账 | 表结构支持；Mihomo 不产出 per-device，设备页基本为空 |
-| 按出口节点（outbound）记账 | **无**。outbound 名在 agent 侧聚合后即丢弃，server 只见 direct/proxy 两类 |
+| 按设备记账 | Mihomo 对局域网 `sourceIP` 产出设备增量；无 sourceIP 时保持节点级。nlbwmon 开启后提供按设备总量 |
+| 按出口节点（outbound）记账 | **R1 已完成**。`proxy_*` 按 outbound 分列存储，求和等于该类总量 |
 | 倍率折算 | 函数完成，server 无倍率表、无配置入口，`proxy_adjusted` 恒等于原始值 |
 | 时间筛选 / 设备筛选 | 无，固定 72h |
 | 日 / 月历史 | 无聚合表，samples 无保留策略 |
@@ -41,6 +41,8 @@
 ## 三、里程碑
 
 ### R1 — 按出口节点与按设备的账本（后端地基）
+
+状态：已实现（分支 `feat/r1-outbound-device-ledgers`）。
 
 前端筛选和代理页节点显示都依赖这一步，必须最先做。
 

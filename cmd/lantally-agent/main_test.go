@@ -19,6 +19,7 @@ import (
 type fakeCollector struct {
 	capability protocol.Capability
 	deltas     []protocol.IfaceDelta
+	devices    []protocol.DeviceDelta
 	proxy      *protocol.ProxyDelta
 	err        error
 }
@@ -31,7 +32,7 @@ func (f fakeCollector) Collect(context.Context, time.Time) (snapshot, error) {
 	if f.err != nil {
 		return snapshot{}, f.err
 	}
-	return snapshot{interfaces: f.deltas, proxy: f.proxy}, nil
+	return snapshot{interfaces: f.deltas, devices: f.devices, proxy: f.proxy}, nil
 }
 
 func TestDisabledIfaceDoesNotPreventSimReporting(t *testing.T) {
@@ -307,6 +308,51 @@ func TestLoadConfigEnablesMihomoFromSecretFile(t *testing.T) {
 	}
 }
 
+func TestLoadConfigLeavesNlbwmonOffByDefault(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("lt_credential_secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "agent.json")
+	raw := `{
+		"server_url":"https://collector.example.test",
+		"site_id":"site-test",
+		"node_id":"node-test",
+		"token_file":` + mustJSON(t, tokenPath) + `,
+		"collectors":{"iface":true}
+	}`
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Collectors.Nlbwmon {
+		t.Fatal("nlbwmon must stay off unless collectors.nlbwmon is true")
+	}
+
+	enabled := `{
+		"server_url":"https://collector.example.test",
+		"site_id":"site-test",
+		"node_id":"node-test",
+		"token_file":` + mustJSON(t, tokenPath) + `,
+		"collectors":{"nlbwmon":true},
+		"nlbwmon":{"command":"/usr/sbin/nlbw"}
+	}`
+	if err := os.WriteFile(configPath, []byte(enabled), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Collectors.Nlbwmon || cfg.Nlbwmon.Command != "/usr/sbin/nlbw" {
+		t.Fatalf("nlbwmon config = %+v", cfg)
+	}
+}
+
 func TestCollectMergesMihomoProxyWithoutDroppingIface(t *testing.T) {
 	var cfg Config
 	cfg.SiteID = "site-test"
@@ -375,6 +421,60 @@ func TestMihomoCollectErrorKeepsIfaceAndRecordsGap(t *testing.T) {
 	}
 	if !foundReset {
 		t.Fatalf("expected collector_reset gap, got %+v", batch.Gaps)
+	}
+}
+
+func TestCollectMergesNlbwmonDevicesWhenEnabled(t *testing.T) {
+	var cfg Config
+	cfg.SiteID = "site-test"
+	cfg.NodeID = "node-test"
+	cfg.Interval = 15 * time.Second
+	cfg.Collectors.Iface = true
+	cfg.Collectors.Nlbwmon = true
+
+	a := newAgent(cfg, "boot-test", map[string]collector{
+		"iface": fakeCollector{
+			capability: protocol.CapIface,
+			deltas:     []protocol.IfaceDelta{{Name: "br-lan", RxDelta: 10, TxDelta: 4}},
+		},
+		"nlbwmon": fakeCollector{
+			capability: protocol.CapNlbwmon,
+			devices: []protocol.DeviceDelta{{
+				ObsIP: "192.168.0.10", ObsMAC: "02:00:00:00:00:0a",
+				RxDelta: 7, TxDelta: 3, Source: protocol.SourceNlbwmon,
+			}},
+		},
+	})
+	batch := a.collect(context.Background(), time.Unix(1_700_000_000, 0).UTC())
+	if !hasCapability(batch.Capabilities, protocol.CapNlbwmon) {
+		t.Fatalf("capabilities = %+v", batch.Capabilities)
+	}
+	if len(batch.Devices) != 1 || batch.Devices[0].Source != protocol.SourceNlbwmon {
+		t.Fatalf("nlbwmon devices missing: %+v", batch.Devices)
+	}
+}
+
+func TestDisabledNlbwmonDoesNotReportDevices(t *testing.T) {
+	var cfg Config
+	cfg.SiteID = "site-test"
+	cfg.NodeID = "node-test"
+	cfg.Interval = 15 * time.Second
+	cfg.Collectors.Nlbwmon = false
+
+	a := newAgent(cfg, "boot-test", map[string]collector{
+		"nlbwmon": fakeCollector{
+			capability: protocol.CapNlbwmon,
+			devices: []protocol.DeviceDelta{{
+				ObsIP: "192.168.0.10", RxDelta: 7, TxDelta: 3, Source: protocol.SourceNlbwmon,
+			}},
+		},
+	})
+	batch := a.collect(context.Background(), time.Unix(1_700_000_000, 0).UTC())
+	if hasCapability(batch.Capabilities, protocol.CapNlbwmon) {
+		t.Fatalf("disabled nlbwmon leaked capability: %+v", batch.Capabilities)
+	}
+	if len(batch.Devices) != 0 {
+		t.Fatalf("disabled nlbwmon leaked devices: %+v", batch.Devices)
 	}
 }
 
