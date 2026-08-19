@@ -62,9 +62,13 @@
     "gaps": {
       "type": "array",
       "items": { "$ref": "#/$defs/gap" }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
     }
   },
-  "additionalProperties": true,
+  "additionalProperties": false,
   "$defs": {
     "iface_delta": {
       "type": "object",

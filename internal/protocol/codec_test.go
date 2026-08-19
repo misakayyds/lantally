@@ -1,6 +1,10 @@
 package protocol
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,6 +36,48 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	if out.Sequence != 7 || out.Interfaces[0].RxDelta != 100 {
 		t.Fatalf("round trip mismatch: %+v", out)
 	}
+}
+
+func TestEncodeUsesEmptyArraysNotNull(t *testing.T) {
+	raw, err := Encode(validBatch())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := gunzipForTest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{
+		`"capabilities":null`,
+		`"interfaces":null`,
+		`"devices":null`,
+	} {
+		if strings.Contains(body, fragment) {
+			t.Fatalf("expected empty arrays, found %s in %s", fragment, body)
+		}
+	}
+	for _, fragment := range []string{
+		`"capabilities":[]`,
+		`"interfaces":[]`,
+		`"devices":[]`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("expected %s in encoded batch: %s", fragment, body)
+		}
+	}
+}
+
+func gunzipForTest(raw []byte) (string, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	defer gr.Close()
+	data, err := io.ReadAll(gr)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func TestDecodeRejectsWrongVersion(t *testing.T) {

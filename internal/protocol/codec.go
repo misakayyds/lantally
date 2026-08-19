@@ -9,6 +9,8 @@ import (
 
 // Encode serializes a batch as gzip-compressed JSON.
 func Encode(b Batch) ([]byte, error) {
+	b = normalizeBatchForEncode(b)
+
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	if err := json.NewEncoder(gw).Encode(b); err != nil {
@@ -35,6 +37,28 @@ func Decode(raw []byte) (Batch, error) {
 		return b, err
 	}
 	return b, nil
+}
+
+func normalizeBatchForEncode(b Batch) Batch {
+	out := b
+	if out.Capabilities == nil {
+		out.Capabilities = []Capability{}
+	}
+	if out.Interfaces == nil {
+		out.Interfaces = []IfaceDelta{}
+	}
+	if out.Devices == nil {
+		out.Devices = []DeviceDelta{}
+	}
+	if out.Gaps == nil {
+		out.Gaps = []Gap{}
+	}
+	if out.Proxy != nil && out.Proxy.ByOutbound == nil {
+		p := *out.Proxy
+		p.ByOutbound = []OutboundDelta{}
+		out.Proxy = &p
+	}
+	return out
 }
 
 func decodePayload(raw []byte) ([]byte, error) {
