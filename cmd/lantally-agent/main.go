@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -129,10 +128,11 @@ type agent struct {
 	bootID     string
 	sequence   uint64
 	collectors []namedCollector
+	firstBatch bool
 }
 
 func newAgent(config Config, bootID string, available map[string]collector) *agent {
-	a := &agent{config: config, bootID: bootID}
+	a := &agent{config: config, bootID: bootID, firstBatch: true}
 	for name, candidate := range available {
 		if name == "iface" && !config.Collectors.Iface {
 			continue
@@ -140,6 +140,14 @@ func newAgent(config Config, bootID string, available map[string]collector) *age
 		a.collectors = append(a.collectors, namedCollector{name: name, collector: candidate})
 	}
 	return a
+}
+
+func newAgentSession(config Config, available map[string]collector) (*agent, error) {
+	id, err := processSessionID()
+	if err != nil {
+		return nil, err
+	}
+	return newAgent(config, id, available), nil
 }
 
 func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
@@ -155,6 +163,14 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 		Capabilities:    []protocol.Capability{},
 		Interfaces:      []protocol.IfaceDelta{},
 		Devices:         []protocol.DeviceDelta{},
+	}
+	if a.firstBatch {
+		batch.Gaps = append(batch.Gaps, protocol.Gap{
+			Reason: protocol.GapReboot,
+			From:   at.Add(-a.config.Interval),
+			To:     at,
+		})
+		a.firstBatch = false
 	}
 	seenCapabilities := make(map[protocol.Capability]struct{})
 	for _, registered := range a.collectors {
@@ -193,20 +209,50 @@ func newBatchQueue(capacity int) *batchQueue {
 }
 
 func (q *batchQueue) Push(batch protocol.Batch) {
+	var droppedFrom time.Time
 	if q.size == q.capacity {
 		dropped := q.items[q.head]
+		droppedFrom = earliestBufferDrop(dropped)
 		q.items[q.head] = protocol.Batch{}
 		q.head = (q.head + 1) % q.capacity
 		q.size--
-		batch.Gaps = append(batch.Gaps, protocol.Gap{
-			Reason: protocol.GapBufferDrop,
-			From:   dropped.SampledAt,
-			To:     batch.SampledAt,
-		})
 	}
 	tail := (q.head + q.size) % q.capacity
 	q.items[tail] = batch
 	q.size++
+	if !droppedFrom.IsZero() {
+		carryBufferDrop(&q.items[q.head], droppedFrom, batch.SampledAt)
+	}
+}
+
+func earliestBufferDrop(dropped protocol.Batch) time.Time {
+	earliest := dropped.SampledAt
+	for _, gap := range dropped.Gaps {
+		if gap.Reason == protocol.GapBufferDrop && (earliest.IsZero() || gap.From.Before(earliest)) {
+			earliest = gap.From
+		}
+	}
+	return earliest
+}
+
+func carryBufferDrop(batch *protocol.Batch, from, to time.Time) {
+	for i := range batch.Gaps {
+		if batch.Gaps[i].Reason != protocol.GapBufferDrop {
+			continue
+		}
+		if batch.Gaps[i].From.IsZero() || from.Before(batch.Gaps[i].From) {
+			batch.Gaps[i].From = from
+		}
+		if to.After(batch.Gaps[i].To) {
+			batch.Gaps[i].To = to
+		}
+		return
+	}
+	batch.Gaps = append(batch.Gaps, protocol.Gap{
+		Reason: protocol.GapBufferDrop,
+		From:   from,
+		To:     to,
+	})
 }
 
 func (q *batchQueue) Peek() protocol.Batch {
@@ -289,8 +335,11 @@ func postBatch(ctx context.Context, client *http.Client, serverURL, token string
 	return nil
 }
 
-func run(ctx context.Context, cfg Config, token, bootID string) error {
-	a := newAgent(cfg, bootID, map[string]collector{"iface": ifacecollector.NewCollector()})
+func run(ctx context.Context, cfg Config, token string) error {
+	a, err := newAgentSession(cfg, map[string]collector{"iface": ifacecollector.NewCollector()})
+	if err != nil {
+		return err
+	}
 	queue := newBatchQueue(defaultQueueCapacity)
 	client := &http.Client{Timeout: 30 * time.Second}
 	retry := newBackoff(time.Second, time.Minute, mathrand.Float64)
@@ -338,17 +387,14 @@ func run(ctx context.Context, cfg Config, token, bootID string) error {
 	}
 }
 
-func bootID() (string, error) {
-	if raw, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
-		if value := strings.TrimSpace(string(raw)); value != "" {
-			return value, nil
-		}
-	}
+func processSessionID() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(raw[:]), nil
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
 }
 
 func main() {
@@ -362,11 +408,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	id, err := bootID()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := run(context.Background(), cfg, token, id); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(context.Background(), cfg, token); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }

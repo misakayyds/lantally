@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,7 +55,59 @@ func TestDisabledIfaceDoesNotPreventSimReporting(t *testing.T) {
 	}
 }
 
-func TestBatchQueueOverflowDropsOldestAndMarksGap(t *testing.T) {
+func TestSequentialAgentSessionsUseDistinctBootIDs(t *testing.T) {
+	var cfg Config
+	cfg.SiteID = "site-test"
+	cfg.NodeID = "node-test"
+	cfg.Interval = 15 * time.Second
+
+	first, err := newAgentSession(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newAgentSession(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBatch := first.collect(context.Background(), time.Unix(1_700_000_000, 0).UTC())
+	secondBatch := second.collect(context.Background(), time.Unix(1_700_000_015, 0).UTC())
+	if firstBatch.Sequence != 1 || secondBatch.Sequence != 1 {
+		t.Fatalf("session sequences = (%d, %d), want (1, 1)", firstBatch.Sequence, secondBatch.Sequence)
+	}
+	if firstBatch.BootID == secondBatch.BootID {
+		t.Fatalf("sequential sessions reused boot_id %q", firstBatch.BootID)
+	}
+	for _, id := range []string{firstBatch.BootID, secondBatch.BootID} {
+		if len(id) != 36 || strings.Count(id, "-") != 4 {
+			t.Fatalf("boot_id %q is not UUID-shaped", id)
+		}
+	}
+}
+
+func TestFirstBatchRecordsRebootGap(t *testing.T) {
+	var cfg Config
+	cfg.SiteID = "site-test"
+	cfg.NodeID = "node-test"
+	cfg.Interval = 15 * time.Second
+	at := time.Unix(1_700_000_000, 0).UTC()
+	a := newAgent(cfg, "session-test", nil)
+
+	first := a.collect(context.Background(), at)
+	if len(first.Gaps) != 1 || first.Gaps[0].Reason != protocol.GapReboot {
+		t.Fatalf("first batch reboot gap missing: %+v", first.Gaps)
+	}
+	if !first.Gaps[0].From.Equal(at.Add(-cfg.Interval)) || !first.Gaps[0].To.Equal(at) {
+		t.Fatalf("first batch reboot gap bounds = %+v", first.Gaps[0])
+	}
+	second := a.collect(context.Background(), at.Add(cfg.Interval))
+	for _, gap := range second.Gaps {
+		if gap.Reason == protocol.GapReboot {
+			t.Fatalf("reboot gap repeated on second batch: %+v", second.Gaps)
+		}
+	}
+}
+
+func TestBatchQueueOverflowMarksNextBatchSent(t *testing.T) {
 	q := newBatchQueue(2)
 	t0 := time.Unix(1_700_000_000, 0).UTC()
 	q.Push(protocol.Batch{Sequence: 1, SampledAt: t0})
@@ -67,16 +120,35 @@ func TestBatchQueueOverflowDropsOldestAndMarksGap(t *testing.T) {
 	if got := q.Peek().Sequence; got != 2 {
 		t.Fatalf("oldest sequence = %d, want 2", got)
 	}
-	q.Pop()
-	newest := q.Peek()
-	if newest.Sequence != 3 {
-		t.Fatalf("newest sequence = %d, want 3", newest.Sequence)
+	nextSent := q.Peek()
+	if len(nextSent.Gaps) != 1 || nextSent.Gaps[0].Reason != protocol.GapBufferDrop {
+		t.Fatalf("overflow gap missing from next batch sent: %+v", nextSent.Gaps)
 	}
-	if len(newest.Gaps) != 1 || newest.Gaps[0].Reason != protocol.GapBufferDrop {
-		t.Fatalf("overflow gap missing: %+v", newest.Gaps)
+	if !nextSent.Gaps[0].From.Equal(t0) || !nextSent.Gaps[0].To.Equal(t0.Add(2*time.Second)) {
+		t.Fatalf("overflow gap has wrong bounds: %+v", nextSent.Gaps[0])
 	}
-	if !newest.Gaps[0].From.Equal(t0) || !newest.Gaps[0].To.Equal(t0.Add(2*time.Second)) {
-		t.Fatalf("overflow gap has wrong bounds: %+v", newest.Gaps[0])
+}
+
+func TestBatchQueueRepeatedOverflowCarriesEarliestBoundary(t *testing.T) {
+	q := newBatchQueue(2)
+	t0 := time.Unix(1_700_000_000, 0).UTC()
+	for sequence := uint64(1); sequence <= 5; sequence++ {
+		q.Push(protocol.Batch{
+			Sequence:  sequence,
+			SampledAt: t0.Add(time.Duration(sequence-1) * time.Second),
+		})
+	}
+
+	nextSent := q.Peek()
+	if nextSent.Sequence != 4 {
+		t.Fatalf("oldest surviving sequence = %d, want 4", nextSent.Sequence)
+	}
+	if len(nextSent.Gaps) != 1 || nextSent.Gaps[0].Reason != protocol.GapBufferDrop {
+		t.Fatalf("carried overflow gap missing: %+v", nextSent.Gaps)
+	}
+	gap := nextSent.Gaps[0]
+	if !gap.From.Equal(t0) || !gap.To.Equal(t0.Add(4*time.Second)) {
+		t.Fatalf("carried gap = %+v, want earliest from %s through %s", gap, t0, t0.Add(4*time.Second))
 	}
 }
 
