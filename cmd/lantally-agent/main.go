@@ -22,6 +22,7 @@ import (
 	mihomocollector "github.com/misakayyds/lantally/internal/collector/mihomo"
 	nlbwmoncollector "github.com/misakayyds/lantally/internal/collector/nlbwmon"
 	"github.com/misakayyds/lantally/internal/protocol"
+	"github.com/misakayyds/lantally/internal/version"
 )
 
 const (
@@ -560,7 +561,12 @@ func processSessionID() (string, error) {
 
 func main() {
 	configPath := flag.String("config", "/etc/lantally-agent.json", "path to agent JSON config")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		log.Fatal(err)

@@ -10,6 +10,7 @@ services:
       - lantally-data:/var/lib/lantally
     environment:
       LANTALLY_AGENT_DIR: /usr/share/lantally/agents
+      # LANTALLY_DEMO: "1"
 
 volumes:
   lantally-data:

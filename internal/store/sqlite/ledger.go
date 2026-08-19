@@ -214,7 +214,8 @@ func deviceScope(group string) string {
 }
 
 const (
-	sampleRetention = 14 * 24 * time.Hour
+	SampleRetentionDays = 14
+	sampleRetention     = SampleRetentionDays * 24 * time.Hour
 	daySeconds      = 86400
 	bucket30m       = 1800
 	bucket2h        = 7200

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/misakayyds/lantally/internal/ingest"
 	"github.com/misakayyds/lantally/internal/store/metrics"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
+	"github.com/misakayyds/lantally/internal/version"
 )
 
 //go:embed install.sh install.ps1
@@ -39,6 +41,45 @@ type sessionStore struct {
 	sessions map[string]time.Time
 }
 
+var sessionTTL = 24 * time.Hour
+
+const loginFailureLimit = 5
+
+type loginLimiter struct {
+	mu       sync.Mutex
+	failures map[string][]time.Time
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{failures: make(map[string][]time.Time)}
+}
+
+func (l *loginLimiter) allow(key string, now time.Time) bool {
+	window := now.Add(-15 * time.Minute)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.failures[key][:0]
+	for _, at := range l.failures[key] {
+		if at.After(window) {
+			kept = append(kept, at)
+		}
+	}
+	l.failures[key] = kept
+	return len(kept) < loginFailureLimit
+}
+
+func (l *loginLimiter) fail(key string, now time.Time) {
+	l.mu.Lock()
+	l.failures[key] = append(l.failures[key], now)
+	l.mu.Unlock()
+}
+
+func (l *loginLimiter) success(key string) {
+	l.mu.Lock()
+	delete(l.failures, key)
+	l.mu.Unlock()
+}
+
 func newSessionStore() *sessionStore {
 	return &sessionStore{sessions: make(map[string]time.Time)}
 }
@@ -50,7 +91,7 @@ func (s *sessionStore) create() (string, error) {
 	}
 	token := hex.EncodeToString(raw[:])
 	s.mu.Lock()
-	s.sessions[token] = time.Now().UTC().Add(24 * time.Hour)
+	s.sessions[token] = time.Now().UTC().Add(sessionTTL)
 	s.mu.Unlock()
 	return token, nil
 }
@@ -62,8 +103,18 @@ func (s *sessionStore) valid(token string) bool {
 	return ok && time.Now().UTC().Before(expires)
 }
 
+func (s *sessionStore) touch(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[token]; !ok {
+		return
+	}
+	s.sessions[token] = time.Now().UTC().Add(sessionTTL)
+}
+
 func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	sessions := newSessionStore()
+	limiter := newLoginLimiter()
 	ingestHandler := ingest.NewHandler(store)
 	if cfg.Metrics != nil {
 		ingestHandler.SetMetrics(cfg.Metrics)
@@ -71,7 +122,7 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/ingest", ingestHandler.Ingest)
 	mux.HandleFunc("GET /healthz", ingestHandler.Healthz)
-	mux.HandleFunc("POST /v1/login", loginHandler(store, sessions))
+	mux.HandleFunc("POST /v1/login", loginHandler(store, sessions, limiter))
 	mux.HandleFunc("POST /v1/logout", logoutHandler(sessions))
 	mux.HandleFunc("GET /v1/setup", setupStatusHandler(store))
 	mux.HandleFunc("POST /v1/setup", setupHandler(store, sessions))
@@ -96,6 +147,9 @@ func Routes(store *sqlitestore.Store, cfg Config) http.Handler {
 	mux.HandleFunc("PUT /v1/proxy/billing", requireSession(sessions, setBillingHandler(store)))
 	mux.HandleFunc("GET /v1/alerts", requireSession(sessions, alertsHandler(store)))
 	mux.HandleFunc("POST /v1/alerts/{id}/ack", requireSession(sessions, ackAlertHandler(store)))
+	mux.HandleFunc("GET /v1/settings", requireSession(sessions, settingsHandler()))
+	mux.HandleFunc("PUT /v1/settings/password", requireSession(sessions, changePasswordHandler(store)))
+	mux.HandleFunc("GET /v1/backup", requireSession(sessions, backupHandler(store)))
 	if cfg.StaticFS != nil {
 		mux.Handle("GET /{$}", http.FileServer(http.FS(cfg.StaticFS)))
 		mux.Handle("GET /styles.css", http.FileServer(http.FS(cfg.StaticFS)))
@@ -111,12 +165,47 @@ func requireSession(sessions *sessionStore, next http.HandlerFunc) http.HandlerF
 			http.Error(w, "login required", http.StatusUnauthorized)
 			return
 		}
+		sessions.touch(cookie.Value)
+		http.SetCookie(w, sessionCookie(r, cookie.Value, int(sessionTTL.Seconds())))
 		next(w, r)
 	}
 }
 
-func loginHandler(store *sqlitestore.Store, sessions *sessionStore) http.HandlerFunc {
+func requestHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func sessionCookie(r *http.Request, token string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     "lantally_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   requestHTTPS(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   maxAge,
+	}
+}
+
+func clientIP(r *http.Request) string {
+	if fwd := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); fwd != "" {
+		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func loginHandler(store *sqlitestore.Store, sessions *sessionStore, limiter *loginLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		key := clientIP(r)
+		now := time.Now().UTC()
+		if !limiter.allow(key, now) {
+			http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+			return
+		}
 		var body struct {
 			Password string `json:"password"`
 		}
@@ -125,21 +214,17 @@ func loginHandler(store *sqlitestore.Store, sessions *sessionStore) http.Handler
 			return
 		}
 		if err := store.AuthenticateAdmin(body.Password); err != nil {
+			limiter.fail(key, now)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		limiter.success(key)
 		token, err := sessions.create()
 		if err != nil {
 			http.Error(w, "session unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     "lantally_session",
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		http.SetCookie(w, sessionCookie(r, token, int(sessionTTL.Seconds())))
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }
@@ -151,14 +236,7 @@ func logoutHandler(sessions *sessionStore) http.HandlerFunc {
 			delete(sessions.sessions, cookie.Value)
 			sessions.mu.Unlock()
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     "lantally_session",
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		http.SetCookie(w, sessionCookie(r, "", -1))
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }
@@ -206,14 +284,57 @@ func setupHandler(store *sqlitestore.Store, sessions *sessionStore) http.Handler
 			http.Error(w, "session unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     "lantally_session",
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		http.SetCookie(w, sessionCookie(r, token, int(sessionTTL.Seconds())))
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func settingsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"app_version":      version.Version,
+			"protocol_version": 1,
+			"retention": map[string]any{
+				"samples_days": sqlitestore.SampleRetentionDays,
+				"daily":        "permanent",
+			},
+			"public_https": "required",
+		})
+	}
+}
+
+func changePasswordHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Current  string `json:"current"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid password", http.StatusBadRequest)
+			return
+		}
+		if err := store.UpdateAdminPassword(body.Current, body.Password); err != nil {
+			if errors.Is(err, sqlitestore.ErrAdminUnauthorized) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func backupHandler(store *sqlitestore.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path, err := store.Backup()
+		if err != nil {
+			http.Error(w, "backup unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="lantally.db"`)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		http.ServeFile(w, r, path)
 	}
 }
 

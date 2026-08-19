@@ -71,6 +71,11 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	batch, err := protocol.Decode(raw)
+	var ver protocol.VersionError
+	if errors.As(err, &ver) {
+		http.Error(w, ver.Error(), http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		http.Error(w, "invalid batch", http.StatusBadRequest)
 		return

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/misakayyds/lantally/internal/enroll"
@@ -27,6 +29,8 @@ type Store struct {
 	db           *sql.DB
 	databasePath string
 }
+
+const schemaVersion = 11
 
 type Node struct {
 	ID         string `json:"id"`
@@ -55,6 +59,7 @@ type OutboundLedger struct {
 }
 
 func Open(dsn string) (*Store, error) {
+	existing := fileDSNSize(dsn) > 0
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -65,11 +70,45 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if existing {
+		version, err := sqliteUserVersion(db)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if version < schemaVersion {
+			if _, err := store.Backup(); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+		}
+	}
 	if err := applyMigrations(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
+}
+
+func fileDSNSize(dsn string) int64 {
+	if dsn == "" || dsn == ":memory:" || strings.Contains(dsn, "mode=memory") {
+		return 0
+	}
+	info, err := os.Stat(dsn)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func sqliteUserVersion(db *sql.DB) (int, error) {
+	var version int
+	err := db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	return version, err
 }
 
 // applyMigrations applies the numbered schema steps needed by both new and

@@ -4,6 +4,7 @@ const ROUTES = {
   devices: { title: "设备", eyebrow: "Traffic" },
   proxy: { title: "代理", eyebrow: "Proxy" },
   alerts: { title: "告警", eyebrow: "Alerts" },
+  settings: { title: "设置", eyebrow: "Settings" },
 };
 
 const EMPTY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>`;
@@ -917,6 +918,102 @@ function renderAlerts(data) {
   });
 }
 
+function renderSettings(data) {
+  const retention = data.retention || {};
+  const samplesDays = retention.samples_days || 14;
+  const daily = retention.daily || "permanent";
+  document.getElementById("settings-content").innerHTML = `
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>管理员密码</h3>
+          <p class="card-sub">修改后当前会话仍然有效</p>
+        </div>
+      </div>
+      <div class="device-actions">
+        <div class="field">
+          <label for="settings-current">当前密码</label>
+          <input id="settings-current" type="password" autocomplete="current-password" />
+        </div>
+        <div class="field">
+          <label for="settings-new">新密码（至少 8 位）</label>
+          <input id="settings-new" type="password" autocomplete="new-password" minlength="8" />
+        </div>
+        <button type="button" id="settings-password-btn" class="btn btn-primary btn-sm">保存密码</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>备份</h3>
+          <p class="card-sub">下载当前 SQLite。升级前 server 也会在迁移时自动复制一份 bak 文件。</p>
+        </div>
+        <button type="button" id="settings-backup-btn" class="btn btn-secondary btn-sm">下载 lantally.db</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3>数据保留与协议</h3>
+          <p class="card-sub">公开部署必须放在 HTTPS 反代后面。</p>
+        </div>
+      </div>
+      <div class="metrics">
+        <article class="metric">
+          <div class="metric-label">明细采样</div>
+          <div class="metric-value">${escapeHtml(String(samplesDays))} 天</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">日聚合</div>
+          <div class="metric-value">${escapeHtml(daily === "permanent" ? "永久" : String(daily))}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">协议版本</div>
+          <div class="metric-value">${escapeHtml(String(data.protocol_version || 1))}</div>
+        </article>
+        <article class="metric">
+          <div class="metric-label">软件版本</div>
+          <div class="metric-value">${escapeHtml(String(data.app_version || ""))}</div>
+        </article>
+      </div>
+      <p class="note">v0.1 冻结 protocol_version=1。旧 agent 可继续上报；未知版本会被拒绝并返回明确错误。升级失败时用数据目录里的 lantally.db.bak-&lt;unix&gt; 覆盖后重启。</p>
+    </div>`;
+  document.getElementById("settings-password-btn").addEventListener("click", async () => {
+    const current = document.getElementById("settings-current").value;
+    const password = document.getElementById("settings-new").value;
+    if (password.length < 8) {
+      showToast("新密码至少 8 位");
+      return;
+    }
+    const response = await api("/v1/settings/password", {
+      method: "PUT",
+      body: JSON.stringify({ current, password }),
+    });
+    if (!response.ok) {
+      showToast(response.status === 401 ? "当前密码不正确" : "修改失败");
+      return;
+    }
+    document.getElementById("settings-current").value = "";
+    document.getElementById("settings-new").value = "";
+    showToast("密码已更新");
+  });
+  document.getElementById("settings-backup-btn").addEventListener("click", async () => {
+    const response = await fetch("/v1/backup", { credentials: "same-origin" });
+    if (!response.ok) {
+      showToast("备份失败");
+      return;
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "lantally.db";
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("已开始下载备份");
+  });
+}
+
 async function loadView(route, id = "") {
   if (route === "nodes" && id) {
     const detailRes = await api(`/v1/nodes/${encodeURIComponent(id)}`);
@@ -984,6 +1081,9 @@ async function loadView(route, id = "") {
       break;
     case "alerts":
       renderAlerts(data);
+      break;
+    case "settings":
+      renderSettings(data);
       break;
   }
   return true;

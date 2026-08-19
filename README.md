@@ -2,66 +2,61 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-LanTally is a privacy-first, self-hosted traffic ledger for home and small networks. Lightweight agents report per-device usage to a central server, which separates direct and proxied traffic, accounts for proxy-node multipliers, and presents a unified history across multiple gateways.
+LanTally is a privacy-first, self-hosted traffic ledger for home and small networks. Lightweight agents report usage to a local server, which splits direct vs proxied traffic, applies outbound multipliers, and keeps a history you can reconcile against a provider bill.
 
-> Source: https://github.com/misakayyds/lantally · First installable image lands with v0.1.0 (`ghcr.io/misakayyds/lantally`). Until that tag is published, build the compose file locally.
+It only observes. It does not change routing, firewall, DHCP, or proxy policy.
 
-## Quick start
+> v0.1.0 · https://github.com/misakayyds/lantally · image `ghcr.io/misakayyds/lantally`
 
-1. Run the server (one container, one port, one volume):
+## Three steps
 
-```bash
-docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:latest
-```
-
-Or from this repo:
+**1. Run one container**
 
 ```bash
-docker compose -f deploy/docker/compose.yaml up --build
+docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:v0.1.0
 ```
 
-2. Open `http://<host>:8080` and set the admin password in the first-run wizard.
-3. Click **Add node**, copy the one-line install command, and run it on the gateway or on the same machine as the server. The page waits until the first batch arrives.
+From this repo: `docker compose -f deploy/docker/compose.yaml up --build`
 
-The installer reads a local Mihomo/OpenClash config if present and never uploads the secret. A laptop-only setup works too: check **This machine is the node** and point Mihomo at `127.0.0.1:9090`.
+Preview with synthetic charts (TEST-NET data only):
 
-Put a public deployment behind HTTPS. Claim codes are short-lived (10 minutes, one use) and travel in the install command.
+```bash
+docker run -d --name lantally -p 8080:8080 -e LANTALLY_DEMO=1 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:v0.1.0
+```
 
-## v0.1 scope
+**2. Set the admin password** in the first-run wizard at `http://<host>:8080`.
 
-- Multiple read-only reporting nodes.
-- Per-device upload, download, and current rate.
-- Direct versus proxied traffic accounting.
-- Raw and multiplier-adjusted proxy usage.
-- Daily and monthly history.
-- Provider-usage reconciliation and anomaly alerts.
-- A single-container default deployment.
-- Linux and OpenWrt agents, with tiered architecture support.
+**3. Add a node.** Copy the one-line install command (Linux / macOS / Windows) and run it on the gateway, or on the same machine if that laptop *is* the node. The page waits until the first batch arrives.
 
-## Explicit non-goals for v0.1
+![Synthetic 72-hour traffic chart](docs/screenshots/overview-synthetic.svg)
 
-- Remote command execution.
-- Bandwidth limiting or traffic blocking.
-- Firewall, routing, DHCP, DNS, or proxy-policy changes.
-- Default collection of domains, URLs, or full destination addresses.
-- Replacing packet-analysis or ISP-grade shaping platforms.
+The installer may read a local Mihomo/OpenClash config. The secret stays on that machine. Public deployments must sit behind HTTPS.
 
-## Planned components
+If the GHCR tag is not visible yet, build locally with compose and use `:latest` after the first tagged release pipeline has run (`git tag v0.1.0 && git push origin v0.1.0`).
 
-- `lantally-agent`: outbound-only collector for interface counters, conntrack, nlbwmon, and Mihomo.
-- `lantally-server`: enrollment, ingestion, identity, accounting, alerting, API, and embedded web UI.
-- SQLite: metadata, identities, configuration, and alert state.
-- VictoriaMetrics: traffic time series and retention.
-- All-in-one image: server, UI, and VictoriaMetrics behind one port and one data volume.
+## What you get
 
-## Design and plan
+- Per-device and per-node totals, direct vs proxy, multiplier-adjusted proxy usage
+- 24h / 72h / 7d / 30d charts (samples kept 14 days; daily totals kept permanently)
+- Alerts for silence, resets, growth, and billing drift over 10%
+- One-time claim codes instead of copying long tokens
 
-- Approved design: [`docs/superpowers/specs/2026-08-18-lantally-design.md`](docs/superpowers/specs/2026-08-18-lantally-design.md)
-- v0.1 implementation plan: [`docs/superpowers/plans/2026-08-18-v0.1-implementation.md`](docs/superpowers/plans/2026-08-18-v0.1-implementation.md)
-- Delivery sequence: [`docs/roadmap.md`](docs/roadmap.md)
-- Implementation ADRs: [`docs/adr/`](docs/adr/)
+## What v0.1 will not do
+
+- Remote commands, rate limits, or firewall/proxy writes
+- Collect domains, URLs, or full destinations
+- Match an ISP bill to the last byte when the provider does not publish rules
+
+## Install agents from a Release
+
+GitHub Releases attach checksums (`SHA256SUMS`), an SPDX SBOM, and binaries for linux/amd64+arm64+armv7+mips/mipsle (softfloat), darwin/amd64+arm64, and windows/amd64. The container already hosts those agents at `/agents/{os}/{arch}`.
+
+## Docs
+
+- Operations (upgrade, backup, HTTPS): [`docs/operations.md`](docs/operations.md)
+- Field reconciliation log: [`docs/reconciliation-v0.1.md`](docs/reconciliation-v0.1.md)
+- Design and ADRs: [`docs/superpowers/specs/2026-08-18-lantally-design.md`](docs/superpowers/specs/2026-08-18-lantally-design.md), [`docs/adr/`](docs/adr/)
 
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
-

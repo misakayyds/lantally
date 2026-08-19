@@ -240,8 +240,12 @@ func TestIngestRejectsProtocolV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec := postBatch(t, handler, testToken, raw); rec.Code != http.StatusBadRequest {
+	rec := postBatch(t, handler, testToken, raw)
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "protocol_version 2") {
+		t.Fatalf("body should name unsupported version, got %q", rec.Body.String())
 	}
 }
 

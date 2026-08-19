@@ -31,17 +31,21 @@ type Supervisor struct {
 }
 
 func NewSupervisor(vmBinary, serverBinary string) *Supervisor {
+	serverArgs := []string{
+		"-listen", "0.0.0.0:8080",
+		"-db", "/var/lib/lantally/meta/lantally.db",
+	}
+	if os.Getenv("LANTALLY_DEMO") == "1" {
+		serverArgs = append(serverArgs, "-demo")
+	}
 	return &Supervisor{
 		vmBinary: vmBinary,
 		vmArgs: []string{
 			"-httpListenAddr=127.0.0.1:8428",
 			"-storageDataPath=/var/lib/lantally/metrics",
 		},
-		server: serverBinary,
-		serverArgs: []string{
-			"-listen", "0.0.0.0:8080",
-			"-db", "/var/lib/lantally/meta/lantally.db",
-		},
+		server:     serverBinary,
+		serverArgs: serverArgs,
 		health: HealthConfig{
 			VMURL:     "http://127.0.0.1:8428/health",
 			ServerURL: "http://127.0.0.1:8080/healthz",

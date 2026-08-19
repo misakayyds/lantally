@@ -37,6 +37,65 @@ func TestBackupCreatesCopy(t *testing.T) {
 	}
 }
 
+func TestOpenBacksUpWhenSchemaBehind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lantally.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`PRAGMA user_version = 10`); err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	matches, err := filepath.Glob(filepath.Join(dir, "lantally.db.bak-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("pre-migration backups = %v, want 1", matches)
+	}
+}
+
+func TestUpdateAdminPassword(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.CreateAdminCredential("old-password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateAdminPassword("wrong", "new-password"); !errors.Is(err, ErrAdminUnauthorized) {
+		t.Fatalf("wrong current = %v, want unauthorized", err)
+	}
+	if err := store.UpdateAdminPassword("old-password", "short"); err == nil {
+		t.Fatal("expected short password error")
+	}
+	if err := store.UpdateAdminPassword("old-password", "new-password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AuthenticateAdmin("old-password"); err == nil {
+		t.Fatal("old password should stop working")
+	}
+	if err := store.AuthenticateAdmin("new-password"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAdminCredentialRoundTrip(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.CreateAdminCredential("test-password"); err != nil {

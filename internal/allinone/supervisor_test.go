@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -36,5 +37,14 @@ func TestHealthPassesWhenBothEndpointsOK(t *testing.T) {
 	states, ok := supervisor.Health(context.Background(), vm.Client())
 	if !ok {
 		t.Fatalf("expected healthy endpoints, got %+v", states)
+	}
+}
+
+func TestNewSupervisorPassesDemoFlagFromEnv(t *testing.T) {
+	t.Setenv("LANTALLY_DEMO", "1")
+	supervisor := NewSupervisor("vm", "server")
+	joined := strings.Join(supervisor.serverArgs, " ")
+	if !strings.Contains(joined, "-demo") {
+		t.Fatalf("serverArgs = %v, want -demo", supervisor.serverArgs)
 	}
 }

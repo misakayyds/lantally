@@ -797,3 +797,119 @@ func TestAgentBinaryServedFromAgentDir(t *testing.T) {
 		t.Fatalf("empty AgentDir = %d, want 404", emptyRec.Code)
 	}
 }
+
+func TestLoginRateLimitedAfterFailures(t *testing.T) {
+	store, err := sqlitestore.Open("file:r6-login-limit?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateAdminCredential("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	handler := Routes(store, Config{})
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/login", strings.NewReader(`{"password":"wrong-password"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "192.0.2.10:1234"
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("fail %d = %d, want 401", i, rec.Code)
+		}
+	}
+	locked := httptest.NewRequest(http.MethodPost, "/v1/login", strings.NewReader(`{"password":"test-password"}`))
+	locked.Header.Set("Content-Type", "application/json")
+	locked.RemoteAddr = "192.0.2.10:1234"
+	lockedRec := httptest.NewRecorder()
+	handler.ServeHTTP(lockedRec, locked)
+	if lockedRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked login = %d, want 429", lockedRec.Code)
+	}
+}
+
+func TestSessionCookieSecureWhenHTTPS(t *testing.T) {
+	store, err := sqlitestore.Open("file:r6-secure-cookie?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateAdminCredential("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	handler := Routes(store, Config{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/login", strings.NewReader(`{"password":"test-password"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login = %d %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("missing session cookie")
+	}
+	if !cookies[0].Secure || !cookies[0].HttpOnly {
+		t.Fatalf("cookie secure=%v httponly=%v, want both true", cookies[0].Secure, cookies[0].HttpOnly)
+	}
+}
+
+func TestSettingsPasswordBackupAndRetention(t *testing.T) {
+	dir := t.TempDir()
+	store, err := sqlitestore.Open(filepath.Join(dir, "lantally.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.CreateAdminCredential("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	handler := Routes(store, Config{})
+	cookie := loginCookie(t, handler, "test-password")
+
+	unauth := httptest.NewRequest(http.MethodGet, "/v1/settings", nil)
+	unauthRec := httptest.NewRecorder()
+	handler.ServeHTTP(unauthRec, unauth)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("settings without login = %d", unauthRec.Code)
+	}
+
+	settings := httptest.NewRequest(http.MethodGet, "/v1/settings", nil)
+	settings.AddCookie(cookie)
+	settingsRec := httptest.NewRecorder()
+	handler.ServeHTTP(settingsRec, settings)
+	if settingsRec.Code != http.StatusOK {
+		t.Fatalf("settings = %d %s", settingsRec.Code, settingsRec.Body.String())
+	}
+	body := settingsRec.Body.String()
+	if !strings.Contains(body, `"samples_days":14`) || !strings.Contains(body, `"protocol_version":1`) {
+		t.Fatalf("settings missing retention/protocol: %s", body)
+	}
+	if !strings.Contains(body, `"app_version"`) {
+		t.Fatalf("settings missing app_version: %s", body)
+	}
+
+	backup := httptest.NewRequest(http.MethodGet, "/v1/backup", nil)
+	backup.AddCookie(cookie)
+	backupRec := httptest.NewRecorder()
+	handler.ServeHTTP(backupRec, backup)
+	if backupRec.Code != http.StatusOK || backupRec.Body.Len() == 0 {
+		t.Fatalf("backup = %d len=%d", backupRec.Code, backupRec.Body.Len())
+	}
+	if disp := backupRec.Header().Get("Content-Disposition"); !strings.Contains(disp, "lantally.db") {
+		t.Fatalf("backup disposition = %q", disp)
+	}
+
+	change := httptest.NewRequest(http.MethodPut, "/v1/settings/password", strings.NewReader(`{"current":"test-password","password":"newer-pass"}`))
+	change.Header.Set("Content-Type", "application/json")
+	change.AddCookie(cookie)
+	changeRec := httptest.NewRecorder()
+	handler.ServeHTTP(changeRec, change)
+	if changeRec.Code != http.StatusOK {
+		t.Fatalf("change password = %d %s", changeRec.Code, changeRec.Body.String())
+	}
+	if err := store.AuthenticateAdmin("newer-pass"); err != nil {
+		t.Fatal(err)
+	}
+}

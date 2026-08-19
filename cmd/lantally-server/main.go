@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -11,16 +12,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/misakayyds/lantally/internal/ingest"
 	"github.com/misakayyds/lantally/internal/server"
 	"github.com/misakayyds/lantally/internal/store/metrics"
 	sqlitestore "github.com/misakayyds/lantally/internal/store/sqlite"
+	"github.com/misakayyds/lantally/internal/version"
 	webassets "github.com/misakayyds/lantally/web"
 )
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:8080", "HTTP listen address")
 	dbPath := flag.String("db", "/var/lib/lantally/meta/lantally.db", "SQLite database path")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	demo := flag.Bool("demo", false, "seed synthetic traffic for local preview")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o750); err != nil {
 		log.Fatal(err)
@@ -33,6 +42,12 @@ func main() {
 
 	if err := server.EnsureFirstRunAdmin(store, os.Stdout); err != nil {
 		log.Fatal(err)
+	}
+	if *demo || os.Getenv("LANTALLY_DEMO") == "1" {
+		if err := ingest.SeedSynthetic(context.Background(), store, time.Now().UTC()); err != nil {
+			log.Fatal(err)
+		}
+		log.Print("seeded synthetic demo traffic")
 	}
 
 	go func() {

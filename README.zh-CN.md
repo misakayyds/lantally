@@ -2,99 +2,60 @@
 
 [English](README.md) | **简体中文**
 
-LanTally 是给家庭和小型网络用的**自托管流量账本**：在网关和代理上放一个很轻的上报程序，把每台设备用了多少流量记下来，区分直连和走代理，再按节点倍率估一估账单，最后在一个网页里看日/月历史。
+LanTally 是给家庭和小型网络用的**自托管流量账本**：在网关或本机放一个很轻的上报程序，把用量记下来，区分直连和走代理，再按出口倍率估账单。
 
-它只观察、记账、对账，**不改你的网络、不限速、不远程执行命令**。数据默认留在你自己的机器上。
+它只观察、记账、对账，**不改你的网络、不限速、不远程执行命令**。
 
-> 源码：https://github.com/misakayyds/lantally。镜像名 `ghcr.io/misakayyds/lantally`；正式 tag 随 v0.1.0 发布。现在可以从仓库本地 `docker compose` 构建。
+> v0.1.0 · https://github.com/misakayyds/lantally · 镜像 `ghcr.io/misakayyds/lantally`
 
 ## 三步上手
 
-1. 跑起来（一个容器、一个端口、一份数据盘）：
+**1. 跑一个容器**
 
 ```bash
-docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:latest
+docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:v0.1.0
 ```
 
-或在本仓库：
+本仓库：`docker compose -f deploy/docker/compose.yaml up --build`
+
+只想看图、不接真网关时加上合成数据（TEST-NET，不是你家的流量）：
 
 ```bash
-docker compose -f deploy/docker/compose.yaml up --build
+docker run -d --name lantally -p 8080:8080 -e LANTALLY_DEMO=1 -v lantally:/var/lib/lantally ghcr.io/misakayyds/lantally:v0.1.0
 ```
 
-2. 打开 `http://<主机>:8080`，按向导设置管理员密码。
-3. 网页上点「添加节点」，把给出的**一条命令**在网关或本机执行。页面会显示「等待上报 → 已收到第一包」。
+**2. 打开** `http://<主机>:8080`，按向导设置管理员密码。
 
-安装脚本只读探测本机 OpenClash/Mihomo，密钥不会上传。只有一台笔记本时，勾选「本机即节点」，Mihomo 默认 `127.0.0.1:9090`。
+**3. 点「添加节点」**，把页面给的一条命令在网关或本机执行。页面会从「等待上报」变成「已收到第一包」。
 
-公网部署请放在 HTTPS 反代后面。领取码 10 分钟内有效、只能兑换一次。
+![合成 72 小时流量图](docs/screenshots/overview-synthetic.svg)
 
-## 它解决什么问题
+安装脚本可能只读本机 Mihomo/OpenClash 配置，密钥不会上传。公网必须放在 HTTPS 反代后面。
 
-家里如果有多台设备、不止一个出口（主路由、旁路由、代理网关），通常很难回答这几件事：
-
-- 今天 / 这个月，哪台手机、电脑、NAS 用了多少流量？
-- 哪些流量是直连，哪些走了代理？
-- 代理节点有倍率时，按账单估算大概用了多少？
-- 自己统计的用量，和机场 / 运营商给的数字差多少？差太多时能不能提醒我？
-
-LanTally 就是为这几件事做的。它不是替代路由器、Clash/Mihomo、ntopng 或运营商后台，而是把各处能看到的计数，收成一份可长期查看的账。
+若 GHCR 上还没有 tag，先本地 compose 构建；打 `v0.1.0` 并 push tag 后，Release 流水线会推镜像和多架构 agent。
 
 ## 你能看到什么
 
-- **按设备**：上传、下载、当前速率
-- **按路径**：直连流量 / 代理流量
-- **按账单口径**：原始代理字节，以及乘上节点倍率后的估算用量
-- **按时间**：日用量、月用量，服务重启后历史还在
-- **对账**：把本地估算和你手动填入（或服务商给出）的用量对照，偏差过大时告警
-- **健康**：某个上报节点长时间不说话、计数器异常跳变时提醒
+- 按设备 / 节点的总量、直连、代理，以及倍率折算
+- 24h / 72h / 7d / 30d 图（明细 14 天，日聚合永久）
+- 节点静默、重置、突增、对账偏差超过 10% 的告警
+- 一次性领取码，不用复制长 token
 
-默认部署是**一个容器、一个端口、一份数据盘**，网页就做在服务里，不必先搭 Grafana。
+## v0.1 明确不会
 
-## 它怎么工作
+- 远程命令、限速、改防火墙或代理策略
+- 记录域名、网址、完整目的地址
+- 在服务商不公开规则时保证和账单分毫不差
 
-```mermaid
-flowchart LR
-  devices[家里的设备] --> gateways[网关 / 代理]
-  gateways --> agent[LanTally Agent]
-  agent -->|只向外上报| server[LanTally 服务]
-  server --> ui[内置网页]
-```
+## 从 Release 装 agent
 
-1. **Agent** 装在能看见流量的地方：OpenWrt 网关、Linux 路由、NAS、Mihomo 代理节点。它只读本地计数（网卡、conntrack、nlbwmon、Mihomo 连接 API），再把汇总后的增量推给服务。Agent **不开放管理端口**，代理密钥和订阅链接也不会离开本机。
-2. **服务端** 负责节点注册、去重、认设备、记账、告警，并提供网页。
-3. 一台中心服务可以接 **多台上报节点**，把不同网关上看到的用量合成一份历史。
+GitHub Release 带校验和、SPDX SBOM，以及 linux/amd64+arm64+armv7+mips/mipsle（softfloat）、darwin、windows/amd64 的 agent。容器里同样托管这些二进制。
 
-典型规模：1 台中心服务 + 1～10 台上报节点。更大的部署可以以后把存储拆出去，协议和页面不用换。
+## 文档
 
-## 隐私与安全
-
-- 默认**没有任何使用数据发到我们这边**；项目本身也不收集遥测。
-- 默认**不记录域名、网址、完整目的地址**。
-- 每个上报节点有独立凭证，可以随时作废。
-- 如果要把服务暴露到公网，请放在你信任的 HTTPS 入口后面。
-- 测试和仓库里禁止出现真实流量、真实设备清单或订阅链接。
-
-v0.1 也**明确不会**：
-
-- 远程开 shell、下发命令
-- 限速、封禁、改防火墙、改路由、改代理策略
-- 抓包、看浏览内容
-- 保证和运营商账单分毫不差（对方不公开计费规则时，谁都做不到）
-
-这些边界是产品选择，不是还没做完。
-
-## 当前进度
-
-v0.1 的目标是先把「可信、只读的账」做稳，再谈别的。
-
-| 阶段 | 内容 |
-| --- | --- |
-| 现在 | 设计、协议和仓库基础已公开；R1–R5 已在开发分支落地（账本、查询、筛选、告警、领取码安装） |
-| v0.1 | 多节点上报、每设备直连/代理账、倍率估算、日/月历史、对账告警、单容器部署 |
-| 以后 | 更多采集方式（如 SNMP、NetFlow）；控制面（限速、策略）只有在记账被验证之后，才会作为可选能力单独设计 |
-
-想跟进度，请看 [Releases](https://github.com/misakayyds/lantally/releases) 和 [路线图](docs/roadmap.md)。开发者文档在英文 [README](README.md)。
+- 运维（升级、备份、HTTPS）：[`docs/operations.md`](docs/operations.md)
+- 7 天对账记录（待发布者自测填入）：[`docs/reconciliation-v0.1.md`](docs/reconciliation-v0.1.md)
+- 设计与 ADR：英文 README 的 Docs 一节
 
 ## 许可证
 

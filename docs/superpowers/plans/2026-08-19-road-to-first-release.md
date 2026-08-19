@@ -1,6 +1,6 @@
 # LanTally 首个可发布版本（v0.1.0）规划
 
-> 状态：R1–R5 已落地。R6–R7 未开始。
+> 状态：R1–R7 已落地。打 `v0.1.0` tag 后由 GitHub Actions 发 Release 与 GHCR。
 > 前置：M1–M9 已在 `main` 落地（注册、摄入、身份、账本、Mihomo 采集、嵌入式 UI、72 小时堆叠图、all-in-one 打包）。
 > 本文接替原计划的 M10，展开为 R1–R7。执行时逐个里程碑拆 TDD 步骤。
 
@@ -112,6 +112,8 @@ Agent（关键设计——**一次性领取码**，避免复制长 token）：
 
 ### R6 — 升级、备份与运维兜底
 
+状态：已实现（分支 `feat/r6-upgrade-ops`）。
+
 - 迁移前自动备份 SQLite（机制已有），升级失败自动回滚说明写入 operations 文档。
 - UI 设置页：修改管理员密码、下载 SQLite 备份、查看数据保留策略。
 - agent 与 server 的协议版本协商：server 拒绝未知 `protocol_version` 时返回明确错误；旧 agent 对新 server 保持可用（v0.1 内协议冻结）。
@@ -119,6 +121,8 @@ Agent（关键设计——**一次性领取码**，避免复制长 token）：
 - **验收**：从上一个 tag 的数据卷启动新版本，迁移成功且图表历史完整；回滚步骤按文档演练一次。
 
 ### R7 — 发布工程
+
+状态：已实现（分支 `feat/r7-release`）。真正的 GitHub Release / GHCR 推送在打 `v0.1.0` tag 后由 Actions 执行。7 天真机对账记录见 `docs/reconciliation-v0.1.md`（待发布者自测填入，仓库内不虚构现场数字）。
 
 - 语义化版本 `v0.1.0`；GitHub Actions：test → 多架构构建（linux/amd64、arm64、mips/mipsle softfloat、darwin/amd64+arm64、windows/amd64）→ 校验和 + SBOM → GitHub Release + GHCR 推送。
 - README（中英）重写为「三步上手」：跑容器 → 设密码 → 加节点；截图用合成数据。
