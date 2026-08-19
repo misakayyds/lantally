@@ -120,6 +120,24 @@ func TestDecodeRejectsUnknownRootField(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsTrailingJSON(t *testing.T) {
+	body := []byte(`{
+		"protocol_version": 1,
+		"site_id": "site-a",
+		"node_id": "node-a",
+		"boot_id": "boot-1",
+		"sequence": 1,
+		"sampled_at": "2023-11-14T22:13:20Z",
+		"interval_ms": 15000,
+		"capabilities": [],
+		"interfaces": [],
+		"devices": []
+	} {}`)
+	if _, err := Decode(body); err == nil {
+		t.Fatal("expected trailing JSON rejection")
+	}
+}
+
 func TestDecodeRejectsOversizedGunzip(t *testing.T) {
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
