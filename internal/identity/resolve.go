@@ -2,8 +2,6 @@
 package identity
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -23,9 +21,21 @@ const (
 )
 
 var (
-	ErrPinnedConflict   = errors.New("conflicting user pins")
-	ErrIdentityNotFound = errors.New("identity not found")
+	ErrPinnedConflict      = errors.New("conflicting user pins")
+	ErrIdentityNotFound    = errors.New("identity not found")
+	ErrConflictingEvidence = errors.New("conflicting identity evidence")
+	ErrResolverNotConfigured = errors.New("identity resolver not configured")
 )
+
+// DeviceDelta is the observation payload consumed by Resolve.
+type DeviceDelta = protocol.DeviceDelta
+
+var defaultResolver *Resolver
+
+// SetResolver configures the package-level Resolve, Merge, and Unmerge helpers.
+func SetResolver(r *Resolver) {
+	defaultResolver = r
+}
 
 type Evidence struct {
 	Rank  EvidenceRank
@@ -33,14 +43,12 @@ type Evidence struct {
 }
 
 type Store interface {
-	CreateIdentity(siteID, deviceID string, now time.Time) error
-	FindIdentities(siteID string, rank int, value string) ([]string, error)
-	AddIdentityEvidence(
-		siteID, deviceID string,
-		rank int,
-		value, nodeID string,
-		observedAt time.Time,
-	) error
+	ResolveIdentityAtomic(
+		siteID, nodeID string,
+		evidence []Evidence,
+		limitation string,
+		now time.Time,
+	) (deviceID string, resolvedLimitation string, err error)
 	CanonicalIdentity(deviceID string) (string, error)
 	IdentityPins(deviceID string) ([]string, error)
 	PinIdentity(siteID, deviceID, pin string, now time.Time) error
@@ -59,28 +67,64 @@ func NewResolver(store Store, nodeID string) *Resolver {
 	return &Resolver{store: store, nodeID: nodeID}
 }
 
-func (r *Resolver) Resolve(
+func Resolve(
 	siteID string,
-	obs protocol.DeviceDelta,
+	obs DeviceDelta,
 	now time.Time,
 ) (deviceID string, limitation string, err error) {
+	if defaultResolver == nil {
+		return "", "", ErrResolverNotConfigured
+	}
+	return defaultResolver.Resolve(siteID, obs, now)
+}
+
+func Merge(a, b string, evidence Evidence) error {
+	if defaultResolver == nil {
+		return ErrResolverNotConfigured
+	}
+	return defaultResolver.Merge(a, b, evidence)
+}
+
+func Unmerge(deviceID string) error {
+	if defaultResolver == nil {
+		return ErrResolverNotConfigured
+	}
+	return defaultResolver.Unmerge(deviceID)
+}
+
+func (r *Resolver) Resolve(
+	siteID string,
+	obs DeviceDelta,
+	now time.Time,
+) (deviceID string, limitation string, err error) {
+	evidence, limitation, err := buildEvidence(r.nodeID, obs, now)
+	if err != nil {
+		return "", "", err
+	}
 	if strings.TrimSpace(siteID) == "" {
 		return "", "", errors.New("site ID is required")
-	}
-	ip := net.ParseIP(strings.TrimSpace(obs.ObsIP))
-	if ip == nil {
-		return "", "", fmt.Errorf("invalid observed IP %q", obs.ObsIP)
 	}
 	if strings.TrimSpace(r.nodeID) == "" {
 		return "", "", errors.New("node ID is required")
 	}
+	return r.store.ResolveIdentityAtomic(siteID, r.nodeID, evidence, limitation, now.UTC())
+}
+
+func buildEvidence(
+	nodeID string,
+	obs DeviceDelta,
+	now time.Time,
+) (evidence []Evidence, limitation string, err error) {
+	ip := net.ParseIP(strings.TrimSpace(obs.ObsIP))
+	if ip == nil {
+		return nil, "", fmt.Errorf("invalid observed IP %q", obs.ObsIP)
+	}
 	now = now.UTC()
 
-	var evidence []Evidence
 	if strings.TrimSpace(obs.ObsMAC) != "" {
 		hardwareAddr, parseErr := net.ParseMAC(obs.ObsMAC)
 		if parseErr != nil {
-			return "", "", fmt.Errorf("invalid observed MAC %q: %w", obs.ObsMAC, parseErr)
+			return nil, "", fmt.Errorf("invalid observed MAC %q: %w", obs.ObsMAC, parseErr)
 		}
 		mac := strings.ToLower(hardwareAddr.String())
 		evidence = append(evidence, Evidence{Rank: RankStableMAC, Value: mac})
@@ -96,54 +140,11 @@ func (r *Resolver) Resolve(
 	} else {
 		evidence = append(evidence, Evidence{
 			Rank:  RankScopedIP,
-			Value: scopedIPValue(r.nodeID, ip.String(), now),
+			Value: scopedIPValue(nodeID, ip.String(), now),
 		})
 		limitation = "source IP scoped to site, node, and one-hour window"
 	}
-
-	for _, candidateEvidence := range evidence {
-		candidates, findErr := r.store.FindIdentities(
-			siteID,
-			int(candidateEvidence.Rank),
-			candidateEvidence.Value,
-		)
-		if findErr != nil {
-			return "", "", findErr
-		}
-		if len(candidates) == 1 {
-			deviceID, err = r.store.CanonicalIdentity(candidates[0])
-			if err != nil {
-				return "", "", err
-			}
-			break
-		}
-		if len(candidates) > 1 {
-			limitation = "conflicting identity evidence; identities were not auto-merged"
-		}
-	}
-
-	if deviceID == "" {
-		deviceID, err = newDeviceID()
-		if err != nil {
-			return "", "", err
-		}
-		if err = r.store.CreateIdentity(siteID, deviceID, now); err != nil {
-			return "", "", err
-		}
-	}
-	for _, item := range evidence {
-		if err = r.store.AddIdentityEvidence(
-			siteID,
-			deviceID,
-			int(item.Rank),
-			item.Value,
-			r.nodeID,
-			now,
-		); err != nil {
-			return "", "", err
-		}
-	}
-	return deviceID, limitation, nil
+	return evidence, limitation, nil
 }
 
 func (r *Resolver) Pin(siteID, deviceID, pin string) error {
@@ -217,12 +218,4 @@ func pinsConflict(a, b []string) bool {
 func scopedIPValue(nodeID, ip string, now time.Time) string {
 	window := now.UTC().Unix() / int64(scopedIPWindow/time.Second)
 	return fmt.Sprintf("%s|%d|%s", nodeID, window, ip)
-}
-
-func newDeviceID() (string, error) {
-	var raw [16]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("generate device ID: %w", err)
-	}
-	return "dev_" + hex.EncodeToString(raw[:]), nil
 }

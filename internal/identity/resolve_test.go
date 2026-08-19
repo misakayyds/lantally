@@ -165,3 +165,91 @@ func TestResolvePersistsEvidenceAcrossReopen(t *testing.T) {
 		t.Fatalf("persisted MAC evidence resolved to %q and %q", first, second)
 	}
 }
+
+func TestResolveSurfacesConflictingEvidence(t *testing.T) {
+	store, resolver := openResolver(t)
+	mac := "02:00:00:00:00:0a"
+	first := resolve(t, resolver, observation("203.0.113.70", mac))
+	second := resolve(t, resolver, observation("203.0.113.71", "02:00:00:00:00:0b"))
+
+	if err := store.AttachIdentityEvidence(
+		"site-a",
+		second,
+		int(identity.RankStableMAC),
+		mac,
+		"node-a",
+		observedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	count, err := store.IdentityEvidenceCount("site-a", int(identity.RankStableMAC), mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("conflicting evidence count = %d, want 2", count)
+	}
+
+	_, limitation, err := resolver.Resolve("site-a", observation("203.0.113.72", mac), observedAt)
+	if !errors.Is(err, identity.ErrConflictingEvidence) {
+		t.Fatalf("resolve error = %v, want ErrConflictingEvidence", err)
+	}
+	if limitation != "conflicting identity evidence; identities were not auto-merged" {
+		t.Fatalf("limitation = %q", limitation)
+	}
+	if first == second {
+		t.Fatalf("setup created identical identities %q", first)
+	}
+}
+
+func TestResolveUsesStableMACBeforeScopedIP(t *testing.T) {
+	_, resolver := openResolver(t)
+	mac := "02:00:00:00:00:0c"
+	macIdentity := resolve(t, resolver, observation("203.0.113.80", mac))
+	ipOnly := resolve(t, resolver, observation("203.0.113.80", ""))
+
+	got := resolve(t, resolver, observation("203.0.113.80", mac))
+	if got != macIdentity {
+		t.Fatalf("stable MAC resolve = %q, want %q", got, macIdentity)
+	}
+	if got == ipOnly {
+		t.Fatalf("scoped IP identity %q won over stable MAC", ipOnly)
+	}
+}
+
+func TestPackageLevelResolveMergeUnmerge(t *testing.T) {
+	_, resolver := openResolver(t)
+	identity.SetResolver(resolver)
+	t.Cleanup(func() { identity.SetResolver(nil) })
+
+	firstObs := observation("203.0.113.90", "02:00:00:00:00:0d")
+	secondObs := observation("203.0.113.91", "02:00:00:00:00:0e")
+	first, _, err := identity.Resolve("site-a", firstObs, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := identity.Resolve("site-a", secondObs, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.Merge(first, second, identity.Evidence{
+		Rank:  identity.RankDHCPNeigh,
+		Value: "synthetic association",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.Unmerge(first); err != nil {
+		t.Fatal(err)
+	}
+	restoredFirst, _, err := identity.Resolve("site-a", firstObs, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredSecond, _, err := identity.Resolve("site-a", secondObs, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restoredFirst == restoredSecond {
+		t.Fatalf("package helpers left one identity %q", restoredFirst)
+	}
+}

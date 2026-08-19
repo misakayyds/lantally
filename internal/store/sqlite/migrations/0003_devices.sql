@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS identity_evidence (
 CREATE INDEX IF NOT EXISTS identity_evidence_lookup_idx
 ON identity_evidence(site_id, evidence_rank, evidence_value);
 
+CREATE UNIQUE INDEX IF NOT EXISTS identity_evidence_device_uq
+ON identity_evidence(site_id, device_id, evidence_rank, evidence_value);
+
 CREATE TABLE IF NOT EXISTS device_pins (
   site_id TEXT NOT NULL,
   pin_id TEXT NOT NULL,

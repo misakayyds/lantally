@@ -1,14 +1,85 @@
 package sqlite
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/misakayyds/lantally/internal/identity"
 )
 
-func (s *Store) CreateIdentity(siteID, deviceID string, now time.Time) error {
-	_, err := s.db.Exec(
+func (s *Store) ResolveIdentityAtomic(
+	siteID, nodeID string,
+	evidence []identity.Evidence,
+	limitation string,
+	now time.Time,
+) (deviceID string, resolvedLimitation string, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", "", err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	resolvedLimitation = limitation
+	for _, candidateEvidence := range evidence {
+		candidates, findErr := findIdentitiesTx(
+			tx,
+			siteID,
+			int(candidateEvidence.Rank),
+			candidateEvidence.Value,
+		)
+		if findErr != nil {
+			return "", "", findErr
+		}
+		if len(candidates) == 1 {
+			deviceID, err = canonicalIdentityTx(tx, candidates[0])
+			if err != nil {
+				return "", "", err
+			}
+			break
+		}
+		if len(candidates) > 1 {
+			return "", "conflicting identity evidence; identities were not auto-merged", identity.ErrConflictingEvidence
+		}
+	}
+
+	if deviceID == "" {
+		deviceID, err = newDeviceID()
+		if err != nil {
+			return "", "", err
+		}
+		if err = createIdentityTx(tx, siteID, deviceID, now); err != nil {
+			return "", "", err
+		}
+	}
+	for _, item := range evidence {
+		if err = addIdentityEvidenceTx(
+			tx,
+			siteID,
+			deviceID,
+			int(item.Rank),
+			item.Value,
+			nodeID,
+			now,
+		); err != nil {
+			return "", "", err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return "", "", err
+	}
+	return deviceID, resolvedLimitation, nil
+}
+
+func createIdentityTx(tx *sql.Tx, siteID, deviceID string, now time.Time) error {
+	_, err := tx.Exec(
 		`INSERT INTO devices (id, site_id, created_at) VALUES (?, ?, ?)`,
 		deviceID,
 		siteID,
@@ -17,8 +88,8 @@ func (s *Store) CreateIdentity(siteID, deviceID string, now time.Time) error {
 	return err
 }
 
-func (s *Store) FindIdentities(siteID string, rank int, value string) ([]string, error) {
-	rows, err := s.db.Query(
+func findIdentitiesTx(tx *sql.Tx, siteID string, rank int, value string) ([]string, error) {
+	rows, err := tx.Query(
 		`SELECT DISTINCT device_id
 		 FROM identity_evidence
 		 WHERE site_id = ? AND evidence_rank = ? AND evidence_value = ?
@@ -51,7 +122,7 @@ func (s *Store) FindIdentities(siteID string, rank int, value string) ([]string,
 	seen := make(map[string]struct{})
 	var identities []string
 	for _, deviceID := range rawIdentities {
-		canonical, err := s.CanonicalIdentity(deviceID)
+		canonical, err := canonicalIdentityTx(tx, deviceID)
 		if err != nil {
 			return nil, err
 		}
@@ -64,34 +135,69 @@ func (s *Store) FindIdentities(siteID string, rank int, value string) ([]string,
 	return identities, nil
 }
 
-func (s *Store) AddIdentityEvidence(
+func addIdentityEvidenceTx(
+	tx *sql.Tx,
 	siteID, deviceID string,
 	rank int,
 	value, nodeID string,
 	observedAt time.Time,
 ) error {
-	_, err := s.db.Exec(
-		`INSERT INTO identity_evidence
+	_, err := tx.Exec(
+		`INSERT OR IGNORE INTO identity_evidence
 			(site_id, device_id, evidence_rank, evidence_value, node_id, observed_at)
-		 SELECT ?, ?, ?, ?, ?, ?
-		 WHERE NOT EXISTS (
-			SELECT 1 FROM identity_evidence
-			WHERE site_id = ? AND evidence_rank = ? AND evidence_value = ?
-		 )`,
+		 VALUES (?, ?, ?, ?, ?, ?)`,
 		siteID,
 		deviceID,
 		rank,
 		value,
 		nodeID,
 		observedAt.UTC().Format(time.RFC3339Nano),
-		siteID,
-		rank,
-		value,
 	)
 	return err
 }
 
+func (s *Store) AttachIdentityEvidence(
+	siteID, deviceID string,
+	rank int,
+	value, nodeID string,
+	observedAt time.Time,
+) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO identity_evidence
+			(site_id, device_id, evidence_rank, evidence_value, node_id, observed_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		siteID,
+		deviceID,
+		rank,
+		value,
+		nodeID,
+		observedAt.UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func (s *Store) IdentityEvidenceCount(
+	siteID string,
+	rank int,
+	value string,
+) (int, error) {
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(DISTINCT device_id)
+		 FROM identity_evidence
+		 WHERE site_id = ? AND evidence_rank = ? AND evidence_value = ?`,
+		siteID,
+		rank,
+		value,
+	).Scan(&count)
+	return count, err
+}
+
 func (s *Store) CanonicalIdentity(deviceID string) (string, error) {
+	return canonicalIdentityTx(s.db, deviceID)
+}
+
+func canonicalIdentityTx(db queryRowContext, deviceID string) (string, error) {
 	seen := make(map[string]struct{})
 	current := deviceID
 	for {
@@ -101,7 +207,7 @@ func (s *Store) CanonicalIdentity(deviceID string) (string, error) {
 		seen[current] = struct{}{}
 
 		var canonical sql.NullString
-		err := s.db.QueryRow(
+		err := db.QueryRow(
 			`SELECT canonical_id FROM devices WHERE id = ?`,
 			current,
 		).Scan(&canonical)
@@ -113,6 +219,10 @@ func (s *Store) CanonicalIdentity(deviceID string) (string, error) {
 		}
 		current = canonical.String
 	}
+}
+
+type queryRowContext interface {
+	QueryRow(query string, args ...any) *sql.Row
 }
 
 func (s *Store) IdentityPins(deviceID string) ([]string, error) {
@@ -196,7 +306,7 @@ func (s *Store) PinIdentity(
 			return err
 		}
 		_, err = tx.Exec(
-			`INSERT INTO identity_evidence
+			`INSERT OR IGNORE INTO identity_evidence
 				(site_id, device_id, evidence_rank, evidence_value, node_id, observed_at)
 			 VALUES (?, ?, 0, ?, '', ?)`,
 			siteID,
@@ -317,6 +427,28 @@ func (s *Store) UnmergeIdentity(deviceID string) (err error) {
 	); err != nil {
 		return err
 	}
+	var winner string
+	if err = tx.QueryRow(
+		`SELECT winner_device_id FROM identity_merges WHERE id = ?`,
+		mergeID,
+	).Scan(&winner); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(
+		`DELETE FROM identity_evidence AS winner_evidence
+		 WHERE winner_evidence.device_id = ?
+		   AND EXISTS (
+			SELECT 1
+			FROM identity_evidence AS loser_evidence
+			WHERE loser_evidence.device_id = ?
+			  AND loser_evidence.evidence_rank = winner_evidence.evidence_rank
+			  AND loser_evidence.evidence_value = winner_evidence.evidence_value
+		   )`,
+		winner,
+		loser,
+	); err != nil {
+		return err
+	}
 	if _, err = tx.Exec(
 		`UPDATE identity_merges SET active = 0 WHERE id = ?`,
 		mergeID,
@@ -324,4 +456,12 @@ func (s *Store) UnmergeIdentity(deviceID string) (err error) {
 		return err
 	}
 	return tx.Commit()
+}
+
+func newDeviceID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate device ID: %w", err)
+	}
+	return "dev_" + hex.EncodeToString(raw[:]), nil
 }
