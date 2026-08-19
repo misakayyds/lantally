@@ -42,6 +42,13 @@ func Decode(raw []byte) (Batch, error) {
 	if err := dec.Decode(&b); err != nil {
 		return b, err
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return b, errors.New("decode payload contains trailing JSON")
+		}
+		return b, err
+	}
 	if err := Validate(b); err != nil {
 		return b, err
 	}
