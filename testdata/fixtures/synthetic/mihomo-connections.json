@@ -1,0 +1,31 @@
+{
+  "downloadTotal": 5000,
+  "uploadTotal": 2000,
+  "memory": 123456,
+  "connections": [
+    {
+      "id": "conn-direct-1",
+      "upload": 300,
+      "download": 700,
+      "chains": ["DIRECT"],
+      "rule": "Match",
+      "rulePayload": "203.0.113.0/24"
+    },
+    {
+      "id": "conn-proxy-1",
+      "upload": 200,
+      "download": 800,
+      "chains": ["PROXY", "ss-test"],
+      "rule": "Match",
+      "rulePayload": "GEOSITE,CN"
+    },
+    {
+      "id": "conn-proxy-2",
+      "upload": 100,
+      "download": 400,
+      "chains": ["PROXY", "ss-test"],
+      "rule": "Match",
+      "rulePayload": "GEOSITE,CN"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+services:
+  lantally:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - lantally-data:/var/lib/lantally
+
+volumes:
+  lantally-data:

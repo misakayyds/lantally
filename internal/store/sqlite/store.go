@@ -24,7 +24,8 @@ var (
 var migrations embed.FS
 
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	databasePath string
 }
 
 type Node struct {
@@ -38,7 +39,7 @@ func Open(dsn string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
+	store := &Store{db: db, databasePath: dsn}
 	if err := store.Ping(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -87,6 +88,15 @@ func applyMigrations(db *sql.DB) error {
 		return err
 	}
 	_, err = db.Exec(string(devicesMigration))
+	if err != nil {
+		return err
+	}
+
+	adminMigration, err := migrations.ReadFile("migrations/0004_admin.sql")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(string(adminMigration))
 	return err
 }
 

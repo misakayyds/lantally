@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,30 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+func TestBackupCreatesCopy(t *testing.T) {
+	store := openTestStore(t)
+	path, err := store.Backup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdminCredentialRoundTrip(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.CreateAdminCredential("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AuthenticateAdmin("test-password"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AuthenticateAdmin("wrong"); err == nil {
+		t.Fatal("expected unauthorized for wrong password")
+	}
 }
 
 func TestOpenMigratesLegacyNodesTable(t *testing.T) {
