@@ -1,0 +1,25 @@
+# Build outputs
+/bin/
+/dist/
+/coverage/
+
+# Local data and configuration
+/.env
+/.env.*
+!/\.env.example
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Go and frontend caches
+/vendor/
+/web/node_modules/
+/web/.vite/
+
