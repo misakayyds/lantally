@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -28,6 +29,21 @@ func Routes(store *sqlitestore.Store) http.Handler {
 }
 
 func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Content-Encoding")), "gzip") {
+		http.Error(w, "content encoding must be gzip", http.StatusBadRequest)
+		return
+	}
+	if !validJSONContentType(r.Header.Get("Content-Type")) {
+		http.Error(w, "content type must be application/json", http.StatusBadRequest)
+		return
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(r.Body, protocol.MaxDecodeSize+1))
+	if err != nil || len(raw) > protocol.MaxDecodeSize || !isGzip(raw) {
+		http.Error(w, "invalid gzip batch", http.StatusBadRequest)
+		return
+	}
+
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -43,16 +59,6 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentEncoding := r.Header.Get("Content-Encoding")
-	if contentEncoding != "" && !strings.EqualFold(contentEncoding, "gzip") {
-		http.Error(w, "unsupported content encoding", http.StatusBadRequest)
-		return
-	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, protocol.MaxDecodeSize+1))
-	if err != nil || len(raw) > protocol.MaxDecodeSize {
-		http.Error(w, "invalid batch", http.StatusBadRequest)
-		return
-	}
 	batch, err := protocol.Decode(raw)
 	if err != nil {
 		http.Error(w, "invalid batch", http.StatusBadRequest)
@@ -105,4 +111,21 @@ func bearerToken(header string) (string, bool) {
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
 	return token, token != "" && !strings.ContainsAny(token, " \t\r\n")
+}
+
+func validJSONContentType(header string) bool {
+	mediaType, params, err := mime.ParseMediaType(header)
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return false
+	}
+	for name, value := range params {
+		if !strings.EqualFold(name, "charset") || !strings.EqualFold(value, "utf-8") {
+			return false
+		}
+	}
+	return true
+}
+
+func isGzip(raw []byte) bool {
+	return len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b
 }

@@ -3,6 +3,7 @@ package enroll
 import (
 	"crypto/rand"
 	"crypto/subtle"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -34,4 +35,28 @@ func VerifyToken(token string, stored []byte) bool {
 	want := stored[saltLength:]
 	got := argon2.IDKey([]byte(token), salt, argonTime, argonMemory, argonThreads, hashLength)
 	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// CredentialID extracts the non-secret lookup identifier from a bearer token.
+func CredentialID(token string) (string, bool) {
+	const prefix = "lt_"
+	if !strings.HasPrefix(token, prefix) {
+		return "", false
+	}
+	credentialID, secret, ok := strings.Cut(strings.TrimPrefix(token, prefix), "_")
+	if !ok || credentialID == "" || len(secret) < 16 {
+		return "", false
+	}
+	for _, c := range []byte(credentialID) {
+		if (c < 'a' || c > 'z') &&
+			(c < 'A' || c > 'Z') &&
+			(c < '0' || c > '9') &&
+			c != '-' {
+			return "", false
+		}
+	}
+	if strings.ContainsAny(secret, " \t\r\n") {
+		return "", false
+	}
+	return credentialID, true
 }

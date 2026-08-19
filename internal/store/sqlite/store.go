@@ -63,12 +63,17 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
-func (s *Store) CreateNode(ctx context.Context, id, siteID string, tokenHash []byte) error {
+func (s *Store) CreateNode(
+	ctx context.Context,
+	id, siteID, credentialID string,
+	tokenHash []byte,
+) error {
 	_, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO nodes (id, site_id, token_hash) VALUES (?, ?, ?)`,
+		`INSERT INTO nodes (id, site_id, credential_id, token_hash) VALUES (?, ?, ?, ?)`,
 		id,
 		siteID,
+		credentialID,
 		tokenHash,
 	)
 	return err
@@ -80,34 +85,29 @@ func (s *Store) RevokeNode(ctx context.Context, id string) error {
 }
 
 func (s *Store) Authenticate(ctx context.Context, token string) (Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id, token_hash, revoked FROM nodes`)
+	credentialID, ok := enroll.CredentialID(token)
+	if !ok {
+		return Node{}, ErrUnauthorized
+	}
+
+	var node Node
+	var tokenHash []byte
+	var revoked bool
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, site_id, token_hash, revoked FROM nodes WHERE credential_id = ?`,
+		credentialID,
+	).Scan(&node.ID, &node.SiteID, &tokenHash, &revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Node{}, ErrUnauthorized
+	}
 	if err != nil {
 		return Node{}, err
 	}
-	defer rows.Close()
-
-	var authenticated Node
-	found := false
-	for rows.Next() {
-		var node Node
-		var tokenHash []byte
-		var revoked bool
-		if err := rows.Scan(&node.ID, &node.SiteID, &tokenHash, &revoked); err != nil {
-			return Node{}, err
-		}
-		match := enroll.VerifyToken(token, tokenHash)
-		if match && !revoked {
-			authenticated = node
-			found = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return Node{}, err
-	}
-	if !found {
+	if revoked || !enroll.VerifyToken(token, tokenHash) {
 		return Node{}, ErrUnauthorized
 	}
-	return authenticated, nil
+	return node, nil
 }
 
 func (s *Store) InsertBatch(
