@@ -11,6 +11,8 @@
 *.db
 *.db-shm
 *.db-wal
+*.db.key
+*.db.bak-*
 
 # Editors and operating systems
 .idea/

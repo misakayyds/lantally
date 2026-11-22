@@ -12,6 +12,15 @@ OUT="${OUT:-dist/release}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
+if [[ "${LANTALLY_SKIP_WEB_BUILD:-0}" != "1" && "${SKIP_WEB_BUILD:-0}" != "1" ]]; then
+  echo "building web UI"
+  (
+    cd web
+    npm ci
+    npm run build
+  )
+fi
+
 build() {
   local os="$1" arch="$2" extra="$3" bin="$4" pkg="$5"
   local -a buildenv=(CGO_ENABLED=0 "GOOS=${os}" "GOARCH=${arch}")
@@ -32,6 +41,7 @@ build linux mipsle GOMIPS=softfloat lantally-agent_linux_mipsle_softfloat ./cmd/
 build darwin amd64 "" lantally-agent_darwin_amd64 ./cmd/lantally-agent
 build darwin arm64 "" lantally-agent_darwin_arm64 ./cmd/lantally-agent
 build windows amd64 "" lantally-agent_windows_amd64.exe ./cmd/lantally-agent
+build windows arm64 "" lantally-agent_windows_arm64.exe ./cmd/lantally-agent
 
 (
   cd "$OUT"

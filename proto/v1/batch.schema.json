@@ -59,6 +59,18 @@
     "proxy": {
       "$ref": "#/$defs/proxy_delta"
     },
+    "dimensions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dimension_delta" }
+    },
+    "proxy_nodes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/provider_snapshot" }
+    },
     "gaps": {
       "type": "array",
       "items": { "$ref": "#/$defs/gap" }
@@ -144,6 +156,9 @@
           "type": "string",
           "minLength": 1
         },
+        "group": {
+          "type": "string"
+        },
         "direct_rx": {
           "type": "integer",
           "minimum": 0
@@ -181,6 +196,62 @@
         "to": {
           "type": "string",
           "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "dimension_delta": {
+      "type": "object",
+      "required": ["type", "key", "rx_delta", "tx_delta"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["group", "process", "domain", "iface"]
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rx_delta": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tx_delta": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "provider_snapshot": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vehicle_type": {
+          "type": "string"
+        },
+        "upload": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "download": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expire": {
+          "type": "integer"
+        },
+        "proxies": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
         }
       },
       "additionalProperties": false

@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const claimTTL = 10 * time.Minute
+const (
+	claimTTL        = 10 * time.Minute
+	claimTimeFormat = "2006-01-02T15:04:05.000000000Z"
+)
 
 var (
 	ErrClaimNotFound = errors.New("claim not found")
@@ -55,7 +58,7 @@ func (s *Store) CreateClaim(ctx context.Context, siteID, nodeID string, local bo
 		siteID,
 		nodeID,
 		localMode,
-		expires.Format(time.RFC3339Nano),
+		expires.Format(claimTimeFormat),
 	)
 	if err != nil {
 		return Claim{}, err
@@ -65,35 +68,30 @@ func (s *Store) CreateClaim(ctx context.Context, siteID, nodeID string, local bo
 
 func (s *Store) RedeemClaim(ctx context.Context, code string, now time.Time) (Claim, error) {
 	nowUTC := now.UTC()
-	nowStr := nowUTC.Format(time.RFC3339Nano)
-	var claim Claim
-	var localMode int
-	var expires string
-	err := s.db.QueryRowContext(
-		ctx,
-		`UPDATE claim_codes
-		 SET redeemed_at = ?
-		 WHERE code = ? AND redeemed_at IS NULL AND expires_at > ?
-		 RETURNING code, site_id, node_id, local_mode, expires_at`,
-		nowStr,
-		code,
-		nowStr,
-	).Scan(&claim.Code, &claim.SiteID, &claim.NodeID, &localMode, &expires)
-	if err == nil {
-		claim.Local = localMode == 1
-		claim.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expires)
-		return claim, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	nowStr := nowUTC.Format(claimTimeFormat)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return Claim{}, err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 
+	var claim Claim
+	var localMode int
+	var expiresRaw string
 	var redeemed sql.NullString
-	err = s.db.QueryRowContext(
+	err = tx.QueryRowContext(
 		ctx,
-		`SELECT expires_at, redeemed_at FROM claim_codes WHERE code = ?`,
+		`SELECT code, site_id, node_id, local_mode, expires_at, redeemed_at
+		 FROM claim_codes
+		 WHERE code = ?`,
 		code,
-	).Scan(&expires, &redeemed)
+	).Scan(&claim.Code, &claim.SiteID, &claim.NodeID, &localMode, &expiresRaw, &redeemed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Claim{}, ErrClaimNotFound
 	}
@@ -103,11 +101,34 @@ func (s *Store) RedeemClaim(ctx context.Context, code string, now time.Time) (Cl
 	if redeemed.Valid {
 		return Claim{}, ErrClaimUsed
 	}
-	expiresAt, _ := time.Parse(time.RFC3339Nano, expires)
-	if !expiresAt.After(nowUTC) {
+	expiresAt, parseErr := time.Parse(time.RFC3339Nano, expiresRaw)
+	if parseErr != nil || !expiresAt.After(nowUTC) {
 		return Claim{}, ErrClaimExpired
 	}
-	return Claim{}, ErrClaimUsed
+
+	res, err := tx.ExecContext(
+		ctx,
+		`UPDATE claim_codes SET redeemed_at = ? WHERE code = ? AND redeemed_at IS NULL`,
+		nowStr,
+		code,
+	)
+	if err != nil {
+		return Claim{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Claim{}, err
+	}
+	if n != 1 {
+		return Claim{}, ErrClaimUsed
+	}
+	if err = tx.Commit(); err != nil {
+		return Claim{}, err
+	}
+	committed = true
+	claim.Local = localMode == 1
+	claim.ExpiresAt = expiresAt
+	return claim, nil
 }
 
 func (s *Store) UpsertNodeToken(ctx context.Context, id, siteID, credentialID string, tokenHash []byte) error {

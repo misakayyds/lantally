@@ -37,14 +37,14 @@ func TestNodeIncrementsPrefersNlbwmonOverIfaceAndMihomo(t *testing.T) {
 	if totals[ClassProxyRaw] != 20 {
 		t.Fatalf("proxy_raw = %d, want 20", totals[ClassProxyRaw])
 	}
-	if totals[ClassProxyAdjusted] != 40 {
-		t.Fatalf("proxy_adjusted = %d, want 40", totals[ClassProxyAdjusted])
+	if totals[ClassProxyAdjusted] != 0 || totals[ClassProxyUnadjusted] != 0 {
+		t.Fatalf("ingest increments must not emit stale proxy_adjusted/proxy_unadjusted: %+v", totals)
 	}
 }
 
 func TestNodeIncrementsFallsBackToIfaceThenMihomo(t *testing.T) {
 	ifaceOnly := protocol.Batch{
-		Interfaces: []protocol.IfaceDelta{{Name: "br-lan", RxDelta: 1024, TxDelta: 512}},
+		Interfaces: []protocol.IfaceDelta{{Name: "eth0", RxDelta: 1024, TxDelta: 512}},
 	}
 	if totals := classTotals(NodeIncrements(ifaceOnly, nil)); totals[ClassTotal] != 1536 {
 		t.Fatalf("iface total = %d, want 1536", totals[ClassTotal])
@@ -62,11 +62,11 @@ func TestNodeIncrementsFallsBackToIfaceThenMihomo(t *testing.T) {
 	if totals[ClassTotal] != 10 {
 		t.Fatalf("mihomo fallback total = %d, want 10", totals[ClassTotal])
 	}
-	if totals[ClassProxyUnadjusted] != 6 {
-		t.Fatalf("unknown multiplier should stay unadjusted, got %d", totals[ClassProxyUnadjusted])
+	if totals[ClassProxyRaw] != 6 {
+		t.Fatalf("mihomo fallback proxy_raw = %d, want 6", totals[ClassProxyRaw])
 	}
-	if totals[ClassProxyAdjusted] != 0 {
-		t.Fatalf("unknown multiplier must not silently use 1.0, adjusted=%d", totals[ClassProxyAdjusted])
+	if totals[ClassProxyAdjusted] != 0 || totals[ClassProxyUnadjusted] != 0 {
+		t.Fatalf("ingest increments must emit raw proxy only, got %+v", totals)
 	}
 }
 
@@ -109,11 +109,8 @@ func TestNodeIncrementsKeepsPerOutboundProxyBreakdown(t *testing.T) {
 	if sum := sumMap(rawByOutbound); sum != totals[ClassProxyRaw] {
 		t.Fatalf("outbound sum %d != proxy_raw %d", sum, totals[ClassProxyRaw])
 	}
-	if outboundTotals(got, ClassProxyAdjusted)["proxy-a"] != 40 {
-		t.Fatalf("proxy-a adjusted = %+v", outboundTotals(got, ClassProxyAdjusted))
-	}
-	if outboundTotals(got, ClassProxyUnadjusted)["proxy-b"] != 40 {
-		t.Fatalf("proxy-b unadjusted = %+v", outboundTotals(got, ClassProxyUnadjusted))
+	if len(outboundTotals(got, ClassProxyAdjusted)) != 0 || len(outboundTotals(got, ClassProxyUnadjusted)) != 0 {
+		t.Fatalf("expected no ingest-time adjusted/unadjusted increments, got %+v", got)
 	}
 }
 
@@ -126,14 +123,11 @@ func TestDeviceIncrementsKeepMihomoOutbound(t *testing.T) {
 		Outbound: "proxy-a",
 	}
 	got := DeviceIncrements(proxy, "dev-a", nil)
-	if len(got) != 2 {
+	if len(got) != 1 {
 		t.Fatalf("mihomo proxy increment = %+v", got)
 	}
 	if got[0].DeviceID != "dev-a" || got[0].Class != ClassProxyRaw || got[0].Outbound != "proxy-a" || got[0].Rx != 9 || got[0].Tx != 1 {
 		t.Fatalf("mihomo proxy raw = %+v", got[0])
-	}
-	if got[1].Class != ClassProxyUnadjusted || got[1].Outbound != "proxy-a" {
-		t.Fatalf("nil multiplier must stay unadjusted, got %+v", got)
 	}
 
 	direct := protocol.DeviceDelta{
@@ -149,7 +143,7 @@ func TestDeviceIncrementsKeepMihomoOutbound(t *testing.T) {
 	}
 }
 
-func TestDeviceIncrementsApplyMultiplier(t *testing.T) {
+func TestDeviceIncrementsEmitRawOnlyRegardlessOfMultiplierMap(t *testing.T) {
 	proxy := protocol.DeviceDelta{
 		ObsIP:    "192.168.0.10",
 		RxDelta:  100,
@@ -158,15 +152,8 @@ func TestDeviceIncrementsApplyMultiplier(t *testing.T) {
 		Outbound: "ss-test",
 	}
 	got := DeviceIncrements(proxy, "dev-a", map[string]float64{"ss-test": 1.5})
-	totals := map[string]uint64{}
-	for _, item := range got {
-		if item.DeviceID != "dev-a" || item.Outbound != "ss-test" {
-			t.Fatalf("unexpected increment %+v", item)
-		}
-		totals[item.Class] += item.Rx + item.Tx
-	}
-	if totals[ClassProxyRaw] != 100 || totals[ClassProxyAdjusted] != 150 || totals[ClassProxyUnadjusted] != 0 {
-		t.Fatalf("device multiplier increments = %+v", totals)
+	if len(got) != 1 || got[0].Class != ClassProxyRaw || got[0].Rx != 100 || got[0].Tx != 0 {
+		t.Fatalf("device increments = %+v, want single ClassProxyRaw", got)
 	}
 }
 
@@ -215,4 +202,136 @@ func sumMap(values map[string]uint64) uint64 {
 		sum += value
 	}
 	return sum
+}
+
+func TestNodeIncrementsExcludesVirtualIfacesFromTotalButPreservesClassIface(t *testing.T) {
+	batch := protocol.Batch{
+		Interfaces: []protocol.IfaceDelta{
+			{Name: "eth0", RxDelta: 1000, TxDelta: 500},
+			{Name: "lo", RxDelta: 200, TxDelta: 200},
+			{Name: "lo0", RxDelta: 50, TxDelta: 50},
+			{Name: "Loopback Pseudo-Interface 1", RxDelta: 300, TxDelta: 300},
+			{Name: "tun0", RxDelta: 900, TxDelta: 100},
+			{Name: "utun4", RxDelta: 400, TxDelta: 100},
+			{Name: "wg0", RxDelta: 250, TxDelta: 50},
+			{Name: "tailscale0", RxDelta: 150, TxDelta: 50},
+			{Name: "Tailscale", RxDelta: 120, TxDelta: 30},
+			{Name: "docker0", RxDelta: 80, TxDelta: 20},
+			{Name: "veth1a2b", RxDelta: 60, TxDelta: 40},
+			{Name: "br-lan", RxDelta: 700, TxDelta: 300},
+		},
+	}
+
+	got := NodeIncrements(batch, nil)
+	totals := classTotals(got)
+	if totals[ClassTotal] != 1500 {
+		t.Fatalf("ClassTotal = %d, want 1500 (eth0 only, virtual/loopback excluded)", totals[ClassTotal])
+	}
+
+	perIface := ifaceTotalsMap(got)
+	for _, iface := range batch.Interfaces {
+		if perIface[iface.Name] != iface.RxDelta+iface.TxDelta {
+			t.Fatalf("ClassIface %q = %d, want %d", iface.Name, perIface[iface.Name], iface.RxDelta+iface.TxDelta)
+		}
+	}
+}
+
+func TestNodeIncrementsFallsBackToProxyWhenAllIfacesExcluded(t *testing.T) {
+	batch := protocol.Batch{
+		Interfaces: []protocol.IfaceDelta{
+			{Name: "lo", RxDelta: 500, TxDelta: 500},
+			{Name: "utun4", RxDelta: 200, TxDelta: 100},
+		},
+		Proxy: &protocol.ProxyDelta{
+			ByOutbound: []protocol.OutboundDelta{
+				{Name: "DIRECT", DirectRx: 30, DirectTx: 10},
+				{Name: "ss-test", ProxyRx: 60, ProxyTx: 20},
+			},
+		},
+	}
+	got := NodeIncrements(batch, nil)
+	totals := classTotals(got)
+	if totals[ClassTotal] != 120 {
+		t.Fatalf("ClassTotal = %d, want 120 (proxy fallback when all ifaces excluded)", totals[ClassTotal])
+	}
+	perIface := ifaceTotalsMap(got)
+	if perIface["lo"] != 1000 || perIface["utun4"] != 300 {
+		t.Fatalf("ClassIface records missing: %+v", perIface)
+	}
+}
+
+func TestNodeIncrementsWithOptionsAllowsBridgeOptInAndCustomPrefixes(t *testing.T) {
+	batch := protocol.Batch{
+		Interfaces: []protocol.IfaceDelta{
+			{Name: "br-lan", RxDelta: 1000, TxDelta: 500},
+			{Name: "lo", RxDelta: 100, TxDelta: 100},
+		},
+	}
+
+	if totals := classTotals(NodeIncrements(batch, nil)); totals[ClassTotal] != 0 {
+		t.Fatalf("expected br-lan and lo excluded by default, got %d", totals[ClassTotal])
+	}
+
+	got := NodeIncrementsWithOptions(batch, nil, NodeOptions{IncludeIfaces: []string{"br-lan"}})
+	if totals := classTotals(got); totals[ClassTotal] != 1500 {
+		t.Fatalf("IncludeIfaces br-lan total = %d, want 1500", totals[ClassTotal])
+	}
+
+	gotAll := NodeIncrementsWithOptions(batch, nil, NodeOptions{ExcludeIfacePrefixes: []string{}})
+	if totals := classTotals(gotAll); totals[ClassTotal] != 1700 {
+		t.Fatalf("empty ExcludeIfacePrefixes total = %d, want 1700", totals[ClassTotal])
+	}
+
+	gotCustom := NodeIncrementsWithOptions(batch, nil, NodeOptions{ExcludeIfacePrefixes: []string{"lo"}})
+	if totals := classTotals(gotCustom); totals[ClassTotal] != 1500 {
+		t.Fatalf("custom ExcludeIfacePrefixes total = %d, want 1500", totals[ClassTotal])
+	}
+}
+
+func ifaceTotalsMap(increments []Increment) map[string]uint64 {
+	out := map[string]uint64{}
+	for _, item := range increments {
+		if item.Class == ClassIface {
+			out[item.Iface] += item.Rx + item.Tx
+		}
+	}
+	return out
+}
+
+func TestNodeIncrementsZeroDeltaIfaceAndNlbwmonWithProxyTraffic(t *testing.T) {
+	// Zero-delta non-excluded iface must fall back to proxy totals so ClassTotal >= ClassProxyRaw.
+	zeroIface := protocol.Batch{
+		Interfaces: []protocol.IfaceDelta{
+			{Name: "eth0", RxDelta: 0, TxDelta: 0},
+		},
+		Proxy: &protocol.ProxyDelta{
+			ByOutbound: []protocol.OutboundDelta{
+				{Name: "DIRECT", DirectRx: 100, DirectTx: 50},
+				{Name: "hk-01", ProxyRx: 1000, ProxyTx: 500},
+			},
+		},
+	}
+	totals := classTotals(NodeIncrements(zeroIface, nil))
+	if totals[ClassTotal] != 1650 || totals[ClassProxyRaw] != 1500 {
+		t.Fatalf("zero-delta iface fallback mismatch: %+v, want total=1650 proxy_raw=1500", totals)
+	}
+
+	// Zero-delta nlbwmon device falls back to non-zero eth0 iface.
+	zeroNlbw := protocol.Batch{
+		Interfaces: []protocol.IfaceDelta{
+			{Name: "eth0", RxDelta: 400, TxDelta: 100},
+		},
+		Devices: []protocol.DeviceDelta{
+			{ObsIP: "203.0.113.10", ObsMAC: "02:00:00:00:00:0a", RxDelta: 0, TxDelta: 0, Source: protocol.SourceNlbwmon},
+		},
+		Proxy: &protocol.ProxyDelta{
+			ByOutbound: []protocol.OutboundDelta{
+				{Name: "hk-01", ProxyRx: 200, ProxyTx: 100},
+			},
+		},
+	}
+	totalsNlbw := classTotals(NodeIncrements(zeroNlbw, nil))
+	if totalsNlbw[ClassTotal] != 500 {
+		t.Fatalf("zero-delta nlbwmon fallback mismatch: %+v, want total=500", totalsNlbw)
+	}
 }

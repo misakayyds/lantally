@@ -1,5 +1,5 @@
-// Package iface collects cumulative Linux interface counters and converts them
-// into interval deltas.
+// Package iface collects cumulative interface counters across platforms and
+// converts them into interval deltas.
 package iface
 
 import (
@@ -119,7 +119,7 @@ func (c *Collector) Collect(ctx context.Context, at time.Time) ([]protocol.Iface
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	snapshot, err := readProcNetDev()
+	snapshot, err := readInterfaces()
 	if err != nil {
 		return nil, nil, err
 	}

@@ -1,6 +1,13 @@
 package metrics
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+)
+
+var promDurationPattern = regexp.MustCompile(`^\d+[smhdwy]$`)
 
 // TodayTotalQuery returns a PromQL expression for today's total bytes.
 func TodayTotalQuery(siteID, nodeID string) string {
@@ -13,11 +20,28 @@ func TodayTotalQuery(siteID, nodeID string) string {
 
 // BillingCycleTotalQuery returns a PromQL expression for the current billing cycle.
 func BillingCycleTotalQuery(siteID, nodeID, cycleStartRFC3339 string) string {
+	return billingCycleTotalQueryAt(siteID, nodeID, cycleStartRFC3339, time.Now().UTC())
+}
+
+func billingCycleTotalQueryAt(siteID, nodeID, cycleStartRFC3339 string, now time.Time) string {
+	window := "30d"
+	trimmed := strings.TrimSpace(cycleStartRFC3339)
+	if promDurationPattern.MatchString(trimmed) {
+		window = trimmed
+	} else if trimmed != "" {
+		if start, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+			secs := int64(now.UTC().Sub(start.UTC()).Seconds())
+			if secs < 1 {
+				secs = 1
+			}
+			window = fmt.Sprintf("%ds", secs)
+		}
+	}
 	return fmt.Sprintf(
-		`sum(increase(lantally_bytes_total{site_id=%q,node_id=%q,class="total"}[%q:]))`,
+		`sum(increase(lantally_bytes_total{site_id=%q,node_id=%q,class="total"}[%s]))`,
 		siteID,
 		nodeID,
-		cycleStartRFC3339,
+		window,
 	)
 }
 

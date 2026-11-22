@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -163,7 +165,10 @@ func (s *Store) ListOpenAlerts(ctx context.Context) ([]Alert, error) {
 
 func (s *Store) SetBilling(ctx context.Context, billing Billing) error {
 	if billing.ResetDay < 1 || billing.ResetDay > 28 {
-		return errors.New("reset_day must be 1-28")
+		return fmt.Errorf("%w: reset_day must be 1-28", ErrInvalidInput)
+	}
+	if billing.ProviderBytes > math.MaxInt64 {
+		return fmt.Errorf("%w: provider_bytes exceeds int64 range", ErrInvalidInput)
 	}
 	_, err := s.db.ExecContext(
 		ctx,
@@ -178,6 +183,24 @@ func (s *Store) SetBilling(ctx context.Context, billing Billing) error {
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func (s *Store) BillingResetDay(ctx context.Context) (int, error) {
+	var resetDay int
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT reset_day FROM billing_checkpoints WHERE id = 1`,
+	).Scan(&resetDay)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 1, nil
+	}
+	if err != nil {
+		return 1, err
+	}
+	if resetDay < 1 || resetDay > 28 {
+		return 1, nil
+	}
+	return resetDay, nil
 }
 
 func (s *Store) BillingStatus(ctx context.Context, now time.Time) (BillingStatus, error) {
@@ -199,7 +222,7 @@ func (s *Store) BillingStatus(ctx context.Context, now time.Time) (BillingStatus
 		return BillingStatus{}, err
 	}
 	from, to := billingPeriod(now, resetDay)
-	local, err := s.periodClassBytes(ctx, accounting.ClassProxyAdjusted, from, to)
+	local, err := s.periodAdjustedProxyBytes(ctx, from, to)
 	if err != nil {
 		return BillingStatus{}, err
 	}
@@ -231,13 +254,23 @@ func (s *Store) EvaluateAlerts(ctx context.Context, now time.Time) error {
 	if err := s.evaluateGrowth(ctx, now); err != nil {
 		return err
 	}
-	return s.evaluateDrift(ctx, now)
+	if err := s.evaluateDrift(ctx, now); err != nil {
+		return err
+	}
+	if err := s.evaluateProviderDrift(ctx, now); err != nil {
+		return err
+	}
+	return s.evaluateWatchQuotas(ctx, now)
 }
 
 func (s *Store) evaluateSilence(ctx context.Context, now time.Time) error {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT id, site_id, last_seen_at, last_interval_ms FROM nodes WHERE revoked = 0`,
+		`SELECT n.id, n.site_id, n.last_seen_at, n.last_interval_ms
+		 FROM nodes n
+		 LEFT JOIN direct_collectors dc ON dc.node_id = n.id
+		 WHERE n.revoked = 0
+		   AND (n.mode != 'direct' OR COALESCE(dc.enabled, 0) = 1)`,
 	)
 	if err != nil {
 		return err
@@ -373,36 +406,239 @@ func (s *Store) evaluateDrift(ctx context.Context, now time.Time) error {
 	return s.RaiseAlert(ctx, rec)
 }
 
-func (s *Store) periodClassBytes(ctx context.Context, class string, from, to time.Time) (uint64, error) {
-	var sum sql.NullInt64
-	err := s.db.QueryRowContext(
+func (s *Store) evaluateProviderDrift(ctx context.Context, now time.Time) error {
+	_, _, groups, err := s.listProviderStatusesWithGroups(ctx, now, time.UTC)
+	if err != nil {
+		return err
+	}
+	firing := map[string]struct{}{}
+	for _, grp := range groups {
+		if grp.usedBytes == 0 || len(grp.members) == 0 {
+			continue
+		}
+		rec, fired := alert.EvalDrift(float64(grp.localAdjusted), float64(grp.usedBytes), alert.DefaultDriftConfig())
+		if !fired {
+			continue
+		}
+		fp := providerDriftFingerprint(grp)
+		rec.ObservedAt = now
+		rec.Fingerprint = fp
+		rec.Message = providerDriftMessage(grp)
+		if err := s.RaiseAlert(ctx, rec); err != nil {
+			return err
+		}
+		firing[fp] = struct{}{}
+	}
+	return s.resolveStaleFingerprints(ctx, "drift|provider|%", firing, now)
+}
+
+func providerDriftFingerprint(grp providerGroupStatus) string {
+	sKey := strings.TrimSpace(grp.sharedGroup)
+	if sKey == "" && len(grp.members) > 0 {
+		sKey = fmt.Sprintf("id:%d", grp.members[0].ID)
+	}
+	if len(grp.members) == 1 && strings.HasPrefix(sKey, "id:") {
+		return fmt.Sprintf("drift|provider|%d|%d", grp.members[0].ID, grp.cycleFrom.Unix())
+	}
+	return fmt.Sprintf("drift|provider|group|%s|%d", sKey, grp.cycleFrom.Unix())
+}
+
+func providerDriftMessage(grp providerGroupStatus) string {
+	if len(grp.members) == 1 {
+		return fmt.Sprintf("provider %q drift exceeds configured target", grp.members[0].Name)
+	}
+	names := make([]string, 0, len(grp.members))
+	for _, m := range grp.members {
+		names = append(names, fmt.Sprintf("%q", m.Name))
+	}
+	return fmt.Sprintf("shared provider group (%s) drift exceeds configured target", strings.Join(names, ", "))
+}
+
+func (s *Store) evaluateWatchQuotas(ctx context.Context, now time.Time) error {
+	items, err := s.ListWatchItems(ctx)
+	if err != nil {
+		return err
+	}
+	rules, err := s.CompiledMultiplierRules(ctx)
+	if err != nil {
+		return err
+	}
+	firing := map[string]struct{}{}
+	for _, item := range items {
+		cycleFrom, cycleTo, _, _, cycleKey := watchCycleWindow(item, now, time.UTC)
+		fp := fmt.Sprintf("quota|watch|%d|%s", item.ID, cycleKey)
+		if !item.Enabled || item.QuotaBytes == 0 {
+			if err := s.ResolveFingerprint(ctx, fp, now); err != nil {
+				return err
+			}
+			continue
+		}
+		st, err := s.evaluateWatchItemWithRules(ctx, item, cycleFrom, cycleTo, 0, time.UTC, now, rules)
+		if err != nil {
+			return err
+		}
+		rec, fired := alert.EvalQuota(float64(st.UsedBytes), float64(item.QuotaBytes), item.Name)
+		if !fired {
+			if err := s.ResolveFingerprint(ctx, fp, now); err != nil {
+				return err
+			}
+			continue
+		}
+		rec.ObservedAt = now
+		rec.Fingerprint = fp
+		if err := s.RaiseAlert(ctx, rec); err != nil {
+			return err
+		}
+		firing[fp] = struct{}{}
+	}
+	return s.resolveStaleFingerprints(ctx, "quota|watch|%", firing, now)
+}
+
+func (s *Store) resolveStaleFingerprints(
+	ctx context.Context,
+	likePattern string,
+	keep map[string]struct{},
+	now time.Time,
+) error {
+	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT SUM(rx + tx) FROM ledger_daily
-		 WHERE device_id = '' AND class = ? AND day >= ? AND day <= ?`,
-		class,
-		from.UTC().Unix(),
-		to.UTC().Unix(),
-	).Scan(&sum)
+		`SELECT fingerprint FROM alerts WHERE fingerprint LIKE ? AND resolved_at IS NULL`,
+		likePattern,
+	)
+	if err != nil {
+		return err
+	}
+	var toResolve []string
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if _, ok := keep[fp]; !ok {
+			toResolve = append(toResolve, fp)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, fp := range toResolve {
+		if err := s.ResolveFingerprint(ctx, fp, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) periodAdjustedProxyBytes(ctx context.Context, from, to time.Time) (uint64, error) {
+	rules, err := s.CompiledMultiplierRules(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if !sum.Valid || sum.Int64 < 0 {
-		return 0, nil
+
+	fromUnix := from.UTC().Unix()
+	toUnix := to.UTC().Unix()
+	fromDay := (fromUnix / daySeconds) * daySeconds
+
+	var rawSeen, adjSum, legAdjSum uint64
+
+	accumulate := func(rows *sql.Rows) error {
+		for rows.Next() {
+			var class, outbound string
+			var rx, tx int64
+			if err := rows.Scan(&class, &outbound, &rx, &tx); err != nil {
+				return err
+			}
+			uRx, uTx := clampUint64(rx), clampUint64(tx)
+			switch class {
+			case accounting.ClassProxyRaw:
+				rawSeen += uRx + uTx
+				m := rules.Match(outbound)
+				adjSum += accounting.ScaleBytes(uRx, m.Factor) + accounting.ScaleBytes(uTx, m.Factor)
+			case accounting.ClassProxyAdjusted:
+				legAdjSum += uRx + uTx
+			}
+		}
+		return rows.Err()
 	}
-	return uint64(sum.Int64), nil
+
+	sampleRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT class, outbound, SUM(rx), SUM(tx)
+		 FROM ledger_samples
+		 WHERE device_id = '' AND class IN (?, ?)
+		   AND sampled_at >= ? AND sampled_at <= ?
+		 GROUP BY class, outbound`,
+		accounting.ClassProxyRaw,
+		accounting.ClassProxyAdjusted,
+		fromUnix,
+		toUnix,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if err := accumulate(sampleRows); err != nil {
+		_ = sampleRows.Close()
+		return 0, err
+	}
+	if err := sampleRows.Close(); err != nil {
+		return 0, err
+	}
+
+	dailyRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT class, outbound, SUM(rx), SUM(tx)
+		 FROM ledger_daily
+		 WHERE device_id = '' AND class IN (?, ?)
+		   AND day >= ? AND day <= ?
+		   AND day NOT IN (SELECT DISTINCT (sampled_at / ?) * ? FROM ledger_samples)
+		 GROUP BY class, outbound`,
+		accounting.ClassProxyRaw,
+		accounting.ClassProxyAdjusted,
+		fromDay,
+		toUnix,
+		daySeconds,
+		daySeconds,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if err := accumulate(dailyRows); err != nil {
+		_ = dailyRows.Close()
+		return 0, err
+	}
+	if err := dailyRows.Close(); err != nil {
+		return 0, err
+	}
+
+	if rawSeen == 0 && legAdjSum > 0 {
+		return legAdjSum, nil
+	}
+	return adjSum, nil
 }
 
-func billingPeriod(now time.Time, resetDay int) (time.Time, time.Time) {
-	now = now.UTC()
+func BillingPeriodInLoc(now time.Time, resetDay int, loc *time.Location) (time.Time, time.Time) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	localNow := now.In(loc)
 	if resetDay < 1 || resetDay > 28 {
 		resetDay = 1
 	}
-	year, month, day := now.Date()
-	from := time.Date(year, month, resetDay, 0, 0, 0, 0, time.UTC)
+	year, month, day := localNow.Date()
+	from := time.Date(year, month, resetDay, 0, 0, 0, 0, loc)
 	if day < resetDay {
 		from = from.AddDate(0, -1, 0)
 	}
-	return from, now
+	return from.UTC(), now.UTC()
+}
+
+func billingPeriod(now time.Time, resetDay int) (time.Time, time.Time) {
+	return BillingPeriodInLoc(now, resetDay, time.UTC)
 }
 
 func alertFingerprint(rec alert.Record) string {

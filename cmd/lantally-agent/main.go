@@ -14,10 +14,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/misakayyds/lantally/internal/accounting"
 	ifacecollector "github.com/misakayyds/lantally/internal/collector/iface"
 	mihomocollector "github.com/misakayyds/lantally/internal/collector/mihomo"
 	nlbwmoncollector "github.com/misakayyds/lantally/internal/collector/nlbwmon"
@@ -26,8 +30,9 @@ import (
 )
 
 const (
-	defaultQueueCapacity = 128
-	defaultInterval      = 15 * time.Second
+	defaultQueueCapacity         = 128
+	defaultInterval              = 15 * time.Second
+	defaultMihomoMetaSyncInterval = 5 * time.Minute
 )
 
 type Config struct {
@@ -47,6 +52,10 @@ type Config struct {
 	}
 	Nlbwmon struct {
 		Command string
+	}
+	Iface struct {
+		ExcludePrefixes []string
+		Include         []string
 	}
 }
 
@@ -68,6 +77,10 @@ type configFile struct {
 	Nlbwmon struct {
 		Command string `json:"command"`
 	} `json:"nlbwmon"`
+	Iface struct {
+		ExcludePrefixes []string `json:"exclude_prefixes"`
+		Include         []string `json:"include"`
+	} `json:"iface"`
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -104,6 +117,12 @@ func LoadConfig(filename string) (Config, error) {
 	cfg.Mihomo.URL = strings.TrimSpace(raw.Mihomo.URL)
 	cfg.Mihomo.SecretFile = strings.TrimSpace(raw.Mihomo.SecretFile)
 	cfg.Nlbwmon.Command = strings.TrimSpace(raw.Nlbwmon.Command)
+	if raw.Iface.ExcludePrefixes != nil {
+		cfg.Iface.ExcludePrefixes = append([]string{}, raw.Iface.ExcludePrefixes...)
+	}
+	if len(raw.Iface.Include) > 0 {
+		cfg.Iface.Include = append([]string(nil), raw.Iface.Include...)
+	}
 	if cfg.ServerURL == "" || cfg.SiteID == "" || cfg.NodeID == "" || cfg.TokenFile == "" {
 		return Config{}, errors.New("server_url, site_id, node_id, and token_file are required")
 	}
@@ -166,6 +185,9 @@ type snapshot struct {
 	interfaces []protocol.IfaceDelta
 	devices    []protocol.DeviceDelta
 	proxy      *protocol.ProxyDelta
+	dimensions []protocol.DimensionDelta
+	proxyNodes []string
+	providers  []protocol.ProviderSnapshot
 	gaps       []protocol.Gap
 }
 
@@ -250,19 +272,127 @@ func (a nlbwmonAdapter) Collect(ctx context.Context, at time.Time) (snapshot, er
 }
 
 type mihomoAdapter struct {
-	inner *mihomocollector.Collector
+	inner        *mihomocollector.Collector
+	client       *mihomocollector.Client
+	metaInterval time.Duration
+	lastMetaSync time.Time
 }
 
-func (a mihomoAdapter) Capability() protocol.Capability {
+func (a *mihomoAdapter) Capability() protocol.Capability {
 	return a.inner.Capability()
 }
 
-func (a mihomoAdapter) Collect(ctx context.Context, at time.Time) (snapshot, error) {
-	proxy, devices, gaps, err := a.inner.Collect(ctx, at)
+func (a *mihomoAdapter) effectiveMetaInterval() time.Duration {
+	if a.metaInterval > 0 {
+		return a.metaInterval
+	}
+	return defaultMihomoMetaSyncInterval
+}
+
+func (a *mihomoAdapter) Collect(ctx context.Context, at time.Time) (snapshot, error) {
+	snap, err := a.inner.CollectSnapshot(ctx, at)
 	if err != nil {
 		return snapshot{}, err
 	}
-	return snapshot{devices: devices, proxy: proxy, gaps: gaps}, nil
+	var dims []protocol.DimensionDelta
+	for _, d := range snap.Dimensions {
+		if d.RxDelta == 0 && d.TxDelta == 0 {
+			continue
+		}
+		dims = append(dims, protocol.DimensionDelta{
+			Type:    protocol.DimensionType(d.Type),
+			Key:     d.Key,
+			RxDelta: d.RxDelta,
+			TxDelta: d.TxDelta,
+		})
+	}
+
+	var proxyNodes []string
+	var protoProviders []protocol.ProviderSnapshot
+	if a.client != nil && (a.lastMetaSync.IsZero() || at.Sub(a.lastMetaSync) >= a.effectiveMetaInterval()) {
+		nodeSet := map[string]struct{}{}
+
+		proxies, pErr := a.client.FetchProxies(ctx)
+		if pErr != nil {
+			log.Printf("mihomo /proxies sync skipped: %v", pErr)
+		} else {
+			for _, p := range proxies {
+				if p.IsGroup {
+					continue
+				}
+				if name := strings.TrimSpace(p.Name); name != "" && !isBuiltinProxyName(name) {
+					nodeSet[name] = struct{}{}
+				}
+			}
+		}
+
+		providers, provErr := a.client.FetchProviders(ctx)
+		if provErr != nil {
+			log.Printf("mihomo /providers/proxies sync skipped: %v", provErr)
+		} else {
+			for _, p := range providers {
+				snapProv := protocol.ProviderSnapshot{
+					Name:        p.Name,
+					VehicleType: p.VehicleType,
+				}
+				if p.SubscriptionInfo != nil {
+					snapProv.Upload = p.SubscriptionInfo.Upload
+					snapProv.Download = p.SubscriptionInfo.Download
+					snapProv.Total = p.SubscriptionInfo.Total
+					snapProv.Expire = p.SubscriptionInfo.Expire
+				}
+				if len(p.Proxies) > 0 {
+					snapProv.Proxies = make([]string, 0, len(p.Proxies))
+					for _, member := range p.Proxies {
+						trimmed := strings.TrimSpace(member)
+						if trimmed == "" {
+							continue
+						}
+						snapProv.Proxies = append(snapProv.Proxies, trimmed)
+						if !isBuiltinProxyName(trimmed) {
+							nodeSet[trimmed] = struct{}{}
+						}
+					}
+				}
+				protoProviders = append(protoProviders, snapProv)
+			}
+		}
+
+		if pErr == nil && (provErr == nil || isHTTP404(provErr)) {
+			a.lastMetaSync = at
+		}
+
+		if len(nodeSet) > 0 {
+			proxyNodes = make([]string, 0, len(nodeSet))
+			for name := range nodeSet {
+				proxyNodes = append(proxyNodes, name)
+			}
+			sort.Strings(proxyNodes)
+		}
+	}
+
+	return snapshot{
+		devices:    snap.Devices,
+		proxy:      snap.Proxy,
+		dimensions: dims,
+		proxyNodes: proxyNodes,
+		providers:  protoProviders,
+		gaps:       snap.Gaps,
+	}, nil
+}
+
+func isHTTP404(err error) bool {
+	var httpErr *mihomocollector.HTTPStatusError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+}
+
+func isBuiltinProxyName(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
@@ -278,6 +408,7 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 		Capabilities:    []protocol.Capability{},
 		Interfaces:      []protocol.IfaceDelta{},
 		Devices:         []protocol.DeviceDelta{},
+		Metadata:        ifaceMetadata(a.config),
 	}
 	if a.firstBatch {
 		batch.Gaps = append(batch.Gaps, protocol.Gap{
@@ -288,6 +419,7 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 		a.firstBatch = false
 	}
 	seenCapabilities := make(map[protocol.Capability]struct{})
+	seenProxyNodes := make(map[string]struct{})
 	for _, registered := range a.collectors {
 		capability := registered.collector.Capability()
 		if _, exists := seenCapabilities[capability]; !exists {
@@ -313,7 +445,26 @@ func (a *agent) collect(ctx context.Context, at time.Time) protocol.Batch {
 				batch.Proxy.ByOutbound = append(batch.Proxy.ByOutbound, snap.proxy.ByOutbound...)
 			}
 		}
+		batch.Dimensions = append(batch.Dimensions, snap.dimensions...)
+		for _, nodeName := range snap.proxyNodes {
+			if _, ok := seenProxyNodes[nodeName]; !ok {
+				seenProxyNodes[nodeName] = struct{}{}
+				batch.ProxyNodes = append(batch.ProxyNodes, nodeName)
+			}
+		}
+		batch.Providers = append(batch.Providers, snap.providers...)
 		batch.Gaps = append(batch.Gaps, snap.gaps...)
+	}
+	for _, inc := range accounting.IfaceIncrements(batch.Interfaces) {
+		if inc.Rx == 0 && inc.Tx == 0 {
+			continue
+		}
+		batch.Dimensions = append(batch.Dimensions, protocol.DimensionDelta{
+			Type:    protocol.DimIface,
+			Key:     inc.Iface,
+			RxDelta: inc.Rx,
+			TxDelta: inc.Tx,
+		})
 	}
 	return batch
 }
@@ -447,46 +598,106 @@ func (b *backoff) Reset() {
 	b.current = 0
 }
 
+type ingestHTTPError struct {
+	statusCode int
+	status     string
+	body       string
+}
+
+func (e *ingestHTTPError) Error() string {
+	if e.body != "" {
+		return fmt.Sprintf("ingest returned %s: %s", e.status, e.body)
+	}
+	return fmt.Sprintf("ingest returned %s", e.status)
+}
+
+func isPermanentIngestRejection(err error) bool {
+	var httpErr *ingestHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	switch httpErr.statusCode {
+	case http.StatusBadRequest,
+		http.StatusConflict,
+		http.StatusRequestEntityTooLarge,
+		http.StatusUnsupportedMediaType,
+		http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
 func postBatch(ctx context.Context, client *http.Client, serverURL, token string, batch protocol.Batch) error {
+	_, _, err := postBatchWithResponse(ctx, client, serverURL, token, batch)
+	return err
+}
+
+func postBatchWithResponse(
+	ctx context.Context,
+	client *http.Client,
+	serverURL, token string,
+	batch protocol.Batch,
+) (protocol.IngestResponse, bool, error) {
 	payload, err := protocol.Encode(batch)
 	if err != nil {
-		return err
+		return protocol.IngestResponse{}, false, err
 	}
 	endpoint, err := url.Parse(serverURL)
 	if err != nil {
-		return err
+		return protocol.IngestResponse{}, false, err
 	}
 	endpoint.Path = path.Join(strings.TrimSuffix(endpoint.Path, "/"), "/v1/ingest")
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return protocol.IngestResponse{}, false, err
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Content-Encoding", "gzip")
 	response, err := client.Do(request)
 	if err != nil {
-		return err
+		return protocol.IngestResponse{}, false, err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("ingest returned %s", response.Status)
+		return protocol.IngestResponse{}, false, &ingestHTTPError{
+			statusCode: response.StatusCode,
+			status:     response.Status,
+			body:       strings.TrimSpace(string(body)),
+		}
 	}
-	return nil
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return protocol.IngestResponse{}, false, nil
+	}
+	var resp protocol.IngestResponse
+	if err := json.Unmarshal(trimmed, &resp); err != nil {
+		log.Printf("decode ingest response warning: %v", err)
+		return protocol.IngestResponse{}, false, nil
+	}
+	return resp, true, nil
 }
 
 func run(ctx context.Context, cfg Config, token string) error {
 	available := map[string]collector{
 		"iface": ifaceAdapter{inner: ifacecollector.NewCollector()},
 	}
+	var mihomoCol *mihomocollector.Collector
 	if cfg.Collectors.Mihomo {
 		secret, err := loadSecret(cfg.Mihomo.SecretFile)
 		if err != nil {
 			return err
 		}
-		available["mihomo"] = mihomoAdapter{
-			inner: mihomocollector.NewCollector(mihomocollector.NewClient(cfg.Mihomo.URL, secret, nil)),
+		mihomoClient := mihomocollector.NewClient(cfg.Mihomo.URL, secret, nil)
+		mihomoCol = mihomocollector.NewCollector(mihomoClient)
+		mihomoCol.Start(ctx)
+		defer mihomoCol.Close()
+		available["mihomo"] = &mihomoAdapter{
+			inner:        mihomoCol,
+			client:       mihomoClient,
+			metaInterval: defaultMihomoMetaSyncInterval,
 		}
 	}
 	if cfg.Collectors.Nlbwmon {
@@ -515,12 +726,24 @@ func run(ctx context.Context, cfg Config, token string) error {
 	}
 	deliver := func() {
 		for queue.Len() > 0 {
-			if err := postBatch(ctx, client, cfg.ServerURL, token, queue.Peek()); err != nil {
+			head := queue.Peek()
+			resp, hasResp, err := postBatchWithResponse(ctx, client, cfg.ServerURL, token, head)
+			if err != nil {
+				if isPermanentIngestRejection(err) {
+					log.Printf("ingest permanently rejected batch seq=%d; dropping from queue: %v", head.Sequence, err)
+					queue.Pop()
+					retry.Reset()
+					continue
+				}
 				delay := retry.Next()
 				log.Printf("ingest failed; retrying in %s: %v", delay, err)
 				retryTimer = time.NewTimer(delay)
 				retryC = retryTimer.C
 				return
+			}
+			if mihomoCol != nil && hasResp {
+				collectDomains := resp.CollectDomains != nil && *resp.CollectDomains
+				mihomoCol.SetDomainOptions(collectDomains, resp.WatchDomains)
 			}
 			queue.Pop()
 			retry.Reset()
@@ -559,6 +782,27 @@ func processSessionID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
 }
 
+func ifaceMetadata(cfg Config) json.RawMessage {
+	if cfg.Iface.ExcludePrefixes == nil && len(cfg.Iface.Include) == 0 {
+		return nil
+	}
+	payload := struct {
+		IfaceExcludePrefixes *[]string `json:"iface_exclude_prefixes,omitempty"`
+		IfaceInclude         []string  `json:"iface_include,omitempty"`
+	}{
+		IfaceInclude: cfg.Iface.Include,
+	}
+	if cfg.Iface.ExcludePrefixes != nil {
+		prefixes := cfg.Iface.ExcludePrefixes
+		payload.IfaceExcludePrefixes = &prefixes
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
 func main() {
 	configPath := flag.String("config", "/etc/lantally-agent.json", "path to agent JSON config")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -575,7 +819,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := run(context.Background(), cfg, token); err != nil && !errors.Is(err, context.Canceled) {
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	if err := run(signalCtx, cfg, token); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }

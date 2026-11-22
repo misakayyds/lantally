@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -167,5 +168,141 @@ func TestDecodeRejectsWrongVersion(t *testing.T) {
 	}
 	if _, err := Decode(raw); err == nil {
 		t.Fatal("expected version rejection")
+	}
+}
+
+func TestEncodeOmitsEmptyOutboundGroupAndPreservesPopulatedGroup(t *testing.T) {
+	withoutGroup := validBatch()
+	withoutGroup.Proxy = &ProxyDelta{
+		ByOutbound: []OutboundDelta{
+			{Name: "ss-test", ProxyRx: 100, ProxyTx: 50},
+		},
+	}
+	raw, err := Encode(withoutGroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := gunzipForTest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body, `"group"`) {
+		t.Fatalf("expected empty group to be omitted, got %s", body)
+	}
+
+	withGroup := validBatch()
+	withGroup.Proxy = &ProxyDelta{
+		ByOutbound: []OutboundDelta{
+			{Name: "ss-test", Group: "PROXY", ProxyRx: 100, ProxyTx: 50},
+		},
+	}
+	raw, err = Encode(withGroup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Proxy == nil || len(decoded.Proxy.ByOutbound) != 1 || decoded.Proxy.ByOutbound[0].Group != "PROXY" {
+		t.Fatalf("group round trip mismatch: %+v", decoded.Proxy)
+	}
+}
+
+func TestEncodeOmitsEmptyExtensionsAndRoundTripsPopulatedExtensions(t *testing.T) {
+	base := validBatch()
+	rawBase, err := Encode(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseJSON, err := gunzipForTest(rawBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, omitted := range []string{`"dimensions"`, `"proxy_nodes"`, `"providers"`} {
+		if strings.Contains(baseJSON, omitted) {
+			t.Fatalf("expected %s to be omitted when empty, got %s", omitted, baseJSON)
+		}
+	}
+
+	ext := validBatch()
+	ext.Dimensions = []DimensionDelta{
+		{Type: DimGroup, Key: "PROXY", RxDelta: 100, TxDelta: 50},
+		{Type: DimProcess, Key: "curl", RxDelta: 0, TxDelta: 0},
+	}
+	ext.ProxyNodes = []string{"hk-01", "jp-01"}
+	ext.Providers = []ProviderSnapshot{{
+		Name:        "sub-alpha",
+		VehicleType: "HTTP",
+		Upload:      10,
+		Download:    20,
+		Total:       1000,
+		Expire:      1800000000,
+		Proxies:     []string{"hk-01"},
+	}}
+	rawExt, err := Encode(ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(rawExt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Dimensions) != 2 || decoded.Dimensions[0].Key != "PROXY" || decoded.Dimensions[1].Type != DimProcess {
+		t.Fatalf("dimensions round-trip mismatch: %+v", decoded.Dimensions)
+	}
+	if len(decoded.ProxyNodes) != 2 || decoded.ProxyNodes[1] != "jp-01" {
+		t.Fatalf("proxy_nodes round-trip mismatch: %+v", decoded.ProxyNodes)
+	}
+	if len(decoded.Providers) != 1 || decoded.Providers[0].Name != "sub-alpha" || len(decoded.Providers[0].Proxies) != 1 {
+		t.Fatalf("providers round-trip mismatch: %+v", decoded.Providers)
+	}
+
+	// Unknown nested field must be rejected by DisallowUnknownFields.
+	badNested := []byte(`{
+		"protocol_version": 1,
+		"site_id": "site-a",
+		"node_id": "node-a",
+		"boot_id": "boot-1",
+		"sequence": 1,
+		"sampled_at": "2023-11-14T22:13:20Z",
+		"interval_ms": 15000,
+		"dimensions": [{"type":"group","key":"PROXY","rx_delta":1,"tx_delta":2,"extra":9}]
+	}`)
+	if _, err := Decode(badNested); err == nil {
+		t.Fatal("expected unknown field in dimension_delta to be rejected")
+	}
+}
+
+func TestVersionErrorUnwrapAndDecodeBoundaries(t *testing.T) {
+	verErr := VersionError{Got: 2, Want: 1}
+	if !errors.Is(verErr, ErrUnsupportedVersion) {
+		t.Fatalf("errors.Is(VersionError, ErrUnsupportedVersion) = false")
+	}
+
+	// Corrupt gzip payload fails decode.
+	if _, err := Decode([]byte{0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff}); err == nil {
+		t.Fatal("expected corrupt gzip error")
+	}
+
+	// Raw JSON > MaxDecodeSize returns ErrDecodeSizeLimit.
+	oversized := bytes.Repeat([]byte(" "), MaxDecodeSize+1)
+	if _, err := Decode(oversized); !errors.Is(err, ErrDecodeSizeLimit) {
+		t.Fatalf("oversized raw JSON err = %v, want ErrDecodeSizeLimit", err)
+	}
+
+	// Proxy != nil with ByOutbound == nil encodes to non-null empty array [].
+	b := validBatch()
+	b.Proxy = &ProxyDelta{}
+	raw, err := Encode(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonStr, err := gunzipForTest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jsonStr, `"by_outbound":[]`) {
+		t.Fatalf("expected non-null empty by_outbound:[], got %s", jsonStr)
 	}
 }

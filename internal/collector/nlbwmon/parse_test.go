@@ -1,6 +1,7 @@
 package nlbwmon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,5 +147,51 @@ func TestTrackerRecordsResetForCounterDecrease(t *testing.T) {
 	}
 	if len(gaps) != 1 || gaps[0].Reason != protocol.GapCollectorReset {
 		t.Fatalf("expected collector reset gap, got %+v", gaps)
+	}
+}
+
+func TestParseStringEncodedCountersInvalidNumbersAndDisappearedDeviceGap(t *testing.T) {
+	dump := `{
+		"columns": ["mac","ip","rx_bytes","tx_bytes"],
+		"data": [
+			["02:00:00:00:00:1a","203.0.113.21","1200","600"],
+			["02:00:00:00:00:1b","203.0.113.22","-5","100"],
+			["02:00:00:00:00:1c","203.0.113.23","100","abc"]
+		]
+	}`
+	got, err := ParseDump(strings.NewReader(dump))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ObsIP != "203.0.113.21" || got[0].RxDelta != 1200 || got[0].TxDelta != 600 {
+		t.Fatalf("string-encoded counter parse mismatch: %+v", got)
+	}
+
+	// Missing required columns returns error when data rows exist.
+	if _, err := ParseDump(strings.NewReader(`{"columns":["mac","ip"],"data":[["02:00:00:00:00:1a","203.0.113.21"]]}`)); err == nil {
+		t.Fatal("expected error for missing rx_bytes/tx_bytes columns")
+	}
+
+	// Disappeared device emits GapCollectorReset.
+	tracker := NewTracker()
+	t0 := time.Unix(1_700_000_000, 0).UTC()
+	tracker.Sample(got, t0)
+	deltas, gaps := tracker.Sample([]protocol.DeviceDelta{}, t0.Add(15*time.Second))
+	if len(deltas) != 0 || len(gaps) != 1 || gaps[0].Reason != protocol.GapCollectorReset {
+		t.Fatalf("disappeared device got deltas=%+v gaps=%+v, want 1 reset gap", deltas, gaps)
+	}
+
+	// Cancelled context returns ctx.Err() before running dump.
+	c := NewCollector(func(context.Context) ([]byte, error) {
+		t.Fatal("dump func should not be called on cancelled ctx")
+		return nil, nil
+	})
+	if c.Capability() != protocol.CapNlbwmon {
+		t.Fatalf("Capability = %q", c.Capability())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := c.Collect(ctx, t0); err == nil {
+		t.Fatal("expected cancelled context error")
 	}
 }

@@ -1,6 +1,7 @@
 package iface
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,5 +98,32 @@ func TestTrackerRecordsResetForCounterDecreaseAndDisappearance(t *testing.T) {
 			!gap.To.Equal(t0.Add(15*time.Second)) {
 			t.Errorf("unexpected gap: %+v", gap)
 		}
+	}
+}
+
+func TestParseProcNetDevEdgesAndCollectorCapabilityCancelled(t *testing.T) {
+	// Duplicate interface rejected.
+	dup := "eth0: 1 0 0 0 0 0 0 0 2 0 0 0 0 0 0 0\neth0: 3 0 0 0 0 0 0 0 4 0 0 0 0 0 0 0\n"
+	if _, err := ParseProcNetDev(strings.NewReader(dup)); err == nil {
+		t.Fatal("expected duplicate interface error")
+	}
+	// Fewer than 16 fields rejected.
+	if _, err := ParseProcNetDev(strings.NewReader("eth0: 1 2 3\n")); err == nil {
+		t.Fatal("expected <16 fields error")
+	}
+	// Invalid tx bytes rejected.
+	badTX := "eth0: 10 0 0 0 0 0 0 0 badtx 0 0 0 0 0 0 0\n"
+	if _, err := ParseProcNetDev(strings.NewReader(badTX)); err == nil {
+		t.Fatal("expected invalid tx bytes error")
+	}
+
+	col := NewCollector()
+	if col.Capability() != protocol.CapIface {
+		t.Fatalf("Capability = %q", col.Capability())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := col.Collect(ctx, time.Now().UTC()); err == nil {
+		t.Fatal("expected cancelled context error")
 	}
 }

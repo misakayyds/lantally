@@ -4,6 +4,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
@@ -11,6 +12,8 @@ services:
     environment:
       LANTALLY_AGENT_DIR: /usr/share/lantally/agents
       # LANTALLY_DEMO: "1"
+      # LANTALLY_BOOTSTRAP_ADMIN_PASSWORD: ""
+      # LANTALLY_METRICS_URL: "http://victoriametrics.example.invalid:8428"
 
 volumes:
   lantally-data:

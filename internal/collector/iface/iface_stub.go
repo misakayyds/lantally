@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !(linux || windows || darwin)
 
 package iface
 
@@ -8,8 +8,8 @@ import (
 	"github.com/misakayyds/lantally/internal/protocol"
 )
 
-var errUnsupported = errors.New("interface collector is only available on Linux")
+var errUnsupported = errors.New("interface collector is not supported on this platform")
 
-func readProcNetDev() ([]protocol.IfaceDelta, error) {
+func readInterfaces() ([]protocol.IfaceDelta, error) {
 	return nil, errUnsupported
 }

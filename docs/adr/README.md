@@ -8,3 +8,6 @@ Accepted implementation decisions for LanTally. Product design lives in [`../sup
 | [0002](0002-sqlite-and-victoriametrics.md) | SQLite metadata and VictoriaMetrics series |
 | [0003](0003-all-in-one-supervisor.md) | All-in-one process supervisor |
 | [0004](0004-accounting-overlap-rules.md) | Accounting overlap and ledger precedence |
+| [0005](0005-sqlite-primary-server-entrypoint.md) | SQLite-primary storage and server entrypoint |
+| [0006](0006-dynamic-multipliers-and-orthogonal-dimensions.md) | Dynamic multipliers and orthogonal dimensions |
+| [0007](0007-streaming-collectors-privacy-and-direct-mode.md) | Streaming collectors, opt-in domain privacy, and direct mode |

@@ -50,7 +50,7 @@ func SeedSynthetic(ctx context.Context, store *sqlitestore.Store, now time.Time)
 		if err != nil {
 			return err
 		}
-		if err := handler.account(ctx, batch); err != nil {
+		if _, err := handler.IngestBatch(ctx, batch); err != nil {
 			return err
 		}
 		if err := handler.observeNode(ctx, batch, inserted); err != nil {

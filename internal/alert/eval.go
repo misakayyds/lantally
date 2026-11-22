@@ -1,7 +1,9 @@
 package alert
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -12,6 +14,7 @@ const (
 	KindSilence Kind = "silence"
 	KindReset   Kind = "reset"
 	KindDrift   Kind = "drift"
+	KindQuota   Kind = "quota"
 )
 
 type Record struct {
@@ -103,5 +106,24 @@ func EvalDrift(adjusted, provider float64, cfg DriftConfig) (Record, bool) {
 	return Record{
 		Kind:    KindDrift,
 		Message: "provider drift exceeds configured target",
+	}, true
+}
+
+// EvalQuota fires when a watch item's used bytes strictly exceed its configured quota.
+func EvalQuota(used, quota float64, name string) (Record, bool) {
+	if math.IsNaN(used) || math.IsInf(used, 0) || math.IsNaN(quota) || math.IsInf(quota, 0) {
+		return Record{}, false
+	}
+	if quota <= 0 || used <= quota {
+		return Record{}, false
+	}
+	label := strings.TrimSpace(name)
+	msg := "watchlist quota exceeded"
+	if label != "" {
+		msg = fmt.Sprintf("watchlist %q exceeded quota", label)
+	}
+	return Record{
+		Kind:    KindQuota,
+		Message: msg,
 	}, true
 }

@@ -6,13 +6,17 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/misakayyds/lantally/internal/accounting"
 	"github.com/misakayyds/lantally/internal/enroll"
 	_ "modernc.org/sqlite"
 )
@@ -20,6 +24,7 @@ import (
 var (
 	ErrSequenceRegression = errors.New("sequence regression")
 	ErrUnauthorized       = errors.New("unauthorized")
+	ErrInvalidInput       = errors.New("invalid input")
 )
 
 //go:embed migrations/*.sql
@@ -28,34 +33,64 @@ var migrations embed.FS
 type Store struct {
 	db           *sql.DB
 	databasePath string
+	secretKey    []byte
 }
 
-const schemaVersion = 11
+const schemaVersion = 14
+
+type RxTxTotal struct {
+	Rx    uint64 `json:"rx"`
+	Tx    uint64 `json:"tx"`
+	Total uint64 `json:"total"`
+}
 
 type Node struct {
-	ID         string `json:"id"`
-	SiteID     string `json:"site_id"`
-	LastSeenAt string `json:"last_seen_at,omitempty"`
-	LastBootID string `json:"last_boot_id,omitempty"`
+	ID             string `json:"id"`
+	SiteID         string `json:"site_id"`
+	Mode           string `json:"mode,omitempty"`
+	LastSeenAt     string `json:"last_seen_at,omitempty"`
+	LastBootID     string `json:"last_boot_id,omitempty"`
+	CollectDomains bool   `json:"collect_domains"`
 }
 
 type DeviceLedger struct {
-	ID     string            `json:"id"`
-	SiteID string            `json:"site_id"`
-	Name   string            `json:"name"`
-	IP     string            `json:"ip,omitempty"`
-	MAC    string            `json:"mac,omitempty"`
-	Bytes  map[string]uint64 `json:"bytes"`
+	ID        string               `json:"id"`
+	SiteID    string               `json:"site_id"`
+	Name      string               `json:"name"`
+	IP        string               `json:"ip,omitempty"`
+	MAC       string               `json:"mac,omitempty"`
+	Rx        uint64               `json:"rx"`
+	Tx        uint64               `json:"tx"`
+	Total     uint64               `json:"total"`
+	Bytes     map[string]uint64    `json:"bytes"`
+	Breakdown map[string]RxTxTotal `json:"breakdown,omitempty"`
 }
 
 type OutboundLedger struct {
-	Name       string  `json:"name"`
-	Raw        uint64  `json:"raw"`
-	Factor     float64 `json:"factor"`
-	Adjusted   uint64  `json:"adjusted"`
-	Unadjusted uint64  `json:"unadjusted"`
-	Configured bool    `json:"configured"`
-	Share      float64 `json:"share"`
+	Name            string  `json:"name"`
+	Rx              uint64  `json:"rx"`
+	Tx              uint64  `json:"tx"`
+	Total           uint64  `json:"total"`
+	Raw             uint64  `json:"raw"`
+	RawRx           uint64  `json:"raw_rx"`
+	RawTx           uint64  `json:"raw_tx"`
+	Factor          float64 `json:"factor"`
+	Adjusted        uint64  `json:"adjusted"`
+	AdjustedRx      uint64  `json:"adjusted_rx"`
+	AdjustedTx      uint64  `json:"adjusted_tx"`
+	Unadjusted      uint64  `json:"unadjusted"`
+	Configured      bool    `json:"configured"`
+	MatchSource     string  `json:"match_source"`
+	MatchedRule     string  `json:"matched_rule,omitempty"`
+	MatchedRuleID   int64   `json:"matched_rule_id,omitempty"`
+	MatchedRuleName string  `json:"matched_rule_name,omitempty"`
+	MatchedType     string  `json:"matched_type,omitempty"`
+	Share           float64 `json:"share"`
+}
+
+type ProxyNodeCatalogEntry struct {
+	Name         string
+	ProviderName string
 }
 
 func Open(dsn string) (*Store, error) {
@@ -91,6 +126,12 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	secretKey, err := loadOrCreateSecretKey(dsn)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	store.secretKey = secretKey
 	return store, nil
 }
 
@@ -238,7 +279,59 @@ func applyMigrations(db *sql.DB) error {
 	if _, err := db.Exec(string(claimsMigration)); err != nil {
 		return err
 	}
+
+	hasMultiplierRules, err := tableExists(db, "multiplier_rules")
+	if err != nil {
+		return err
+	}
+	dimRulesMigration, err := migrations.ReadFile("migrations/0012_dimensions_rules.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(dimRulesMigration)); err != nil {
+		return err
+	}
+	if !hasMultiplierRules {
+		if _, err := db.Exec(`
+			INSERT OR IGNORE INTO multiplier_rules
+				(name, match_type, pattern, factor, priority, enabled, updated_at)
+			SELECT name, 'exact', name, factor, 100, 1, updated_at
+			FROM outbound_multipliers
+			WHERE factor > 0
+		`); err != nil {
+			return err
+		}
+	}
+	if err := addNodeColumn(db, "collect_domains", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	watchProvidersMigration, err := migrations.ReadFile("migrations/0013_watch_providers.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(watchProvidersMigration)); err != nil {
+		return err
+	}
+	directCollectorsMigration, err := migrations.ReadFile("migrations/0014_direct_collectors.sql")
+	if err != nil {
+		return err
+	}
+	if _, err := db.Exec(string(directCollectorsMigration)); err != nil {
+		return err
+	}
+	if err := addNodeColumn(db, "mode", `TEXT NOT NULL DEFAULT 'agent'`); err != nil {
+		return err
+	}
 	return nil
+}
+
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`,
+		table,
+	).Scan(&count)
+	return count > 0, err
 }
 
 func addNodeColumn(db *sql.DB, name, decl string) error {
@@ -313,7 +406,7 @@ func (s *Store) CreateNode(
 }
 
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id, last_seen_at, last_boot_id FROM nodes WHERE revoked = 0 ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, site_id, mode, last_seen_at, last_boot_id, collect_domains FROM nodes WHERE revoked = 0 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -322,9 +415,11 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 	var nodes []Node
 	for rows.Next() {
 		var node Node
-		if err := rows.Scan(&node.ID, &node.SiteID, &node.LastSeenAt, &node.LastBootID); err != nil {
+		var collectInt int
+		if err := rows.Scan(&node.ID, &node.SiteID, &node.Mode, &node.LastSeenAt, &node.LastBootID, &collectInt); err != nil {
 			return nil, err
 		}
+		node.CollectDomains = collectInt != 0
 		nodes = append(nodes, node)
 	}
 	return nodes, rows.Err()
@@ -332,19 +427,238 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 
 func (s *Store) GetNode(ctx context.Context, id string) (Node, error) {
 	var node Node
+	var collectInt int
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT id, site_id, last_seen_at, last_boot_id FROM nodes WHERE id = ? AND revoked = 0`,
+		`SELECT id, site_id, mode, last_seen_at, last_boot_id, collect_domains FROM nodes WHERE id = ? AND revoked = 0`,
 		id,
-	).Scan(&node.ID, &node.SiteID, &node.LastSeenAt, &node.LastBootID)
+	).Scan(&node.ID, &node.SiteID, &node.Mode, &node.LastSeenAt, &node.LastBootID, &collectInt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, err
 	}
+	node.CollectDomains = collectInt != 0
 	return node, err
 }
 
+func (s *Store) SetNodeCollectDomains(ctx context.Context, id string, enabled bool) error {
+	val := 0
+	if enabled {
+		val = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET collect_domains = ? WHERE id = ? AND revoked = 0`, val, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		err = sql.ErrNoRows
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = tx.ExecContext(
+		ctx,
+		`UPDATE direct_collectors SET collect_domains = ?, updated_at = ? WHERE node_id = ?`,
+		val,
+		now,
+		id,
+	); err != nil {
+		return err
+	}
+	err = tx.Commit()
+	return err
+}
+
+func (s *Store) NodeDomainPreferences(ctx context.Context, nodeID string) (bool, []string, error) {
+	var collectInt int
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT collect_domains FROM nodes WHERE id = ? AND revoked = 0`,
+		nodeID,
+	).Scan(&collectInt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	watchDomains, err := s.WatchDomainsForNode(ctx, nodeID)
+	if err != nil {
+		return false, nil, err
+	}
+	return collectInt != 0, watchDomains, nil
+}
+
+func (s *Store) WatchDomainsForNode(ctx context.Context, nodeID string) ([]string, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT matchers_json FROM watch_items WHERE enabled = 1 ORDER BY id ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	domainSet := map[string]struct{}{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var matchers accounting.WatchMatcherMap
+		if err := json.Unmarshal([]byte(raw), &matchers); err != nil {
+			continue
+		}
+		if nodeMatcher, hasNode := matchers[accounting.WatchDimNode]; hasNode {
+			cm, err := accounting.CompileDimensionMatcher(accounting.WatchDimNode, nodeMatcher)
+			if err != nil || !cm.Match(nodeID) {
+				continue
+			}
+		}
+		domMatcher, hasDomain := matchers[accounting.WatchDimDomain]
+		if !hasDomain {
+			continue
+		}
+		for _, v := range domMatcher.Values {
+			switch domMatcher.Type {
+			case accounting.MatchExact:
+				norm := strings.ToLower(strings.TrimRight(strings.TrimSpace(v), "."))
+				if norm == "" {
+					continue
+				}
+				if _, ipErr := netip.ParseAddr(norm); ipErr == nil {
+					continue
+				}
+				domainSet[norm] = struct{}{}
+			case accounting.MatchKeyword:
+				kw := strings.ToLower(strings.TrimSpace(v))
+				if kw != "" {
+					domainSet["kw:"+kw] = struct{}{}
+				}
+			case accounting.MatchRegex:
+				if strings.TrimSpace(v) != "" {
+					domainSet["re:"+v] = struct{}{}
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var watchDomains []string
+	if len(domainSet) > 0 {
+		watchDomains = make([]string, 0, len(domainSet))
+		for d := range domainSet {
+			watchDomains = append(watchDomains, d)
+		}
+		sort.Strings(watchDomains)
+	}
+	return watchDomains, nil
+}
+
+func (s *Store) UpsertProxyNodeCatalog(ctx context.Context, nodeID string, entries []ProxyNodeCatalogEntry, now time.Time) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	ts := now.UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO proxy_node_catalog (node_id, name, provider_name, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(node_id, name) DO UPDATE SET
+			provider_name = CASE WHEN excluded.provider_name != '' THEN excluded.provider_name ELSE proxy_node_catalog.provider_name END,
+			updated_at = excluded.updated_at
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			continue
+		}
+		if _, err = stmt.ExecContext(ctx, nodeID, name, strings.TrimSpace(entry.ProviderName), ts); err != nil {
+			return err
+		}
+	}
+	err = tx.Commit()
+	return err
+}
+
+func (s *Store) ListProxyNodeNames(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT name FROM proxy_node_catalog ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 func (s *Store) RevokeNode(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET revoked = 1 WHERE id = ?`, id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, `UPDATE nodes SET revoked = 1 WHERE id = ?`, id); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = tx.ExecContext(
+		ctx,
+		`UPDATE direct_collectors SET enabled = 0, updated_at = ? WHERE node_id = ?`,
+		now,
+		id,
+	); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(
+		ctx,
+		`UPDATE alerts SET resolved_at = ? WHERE fingerprint = ? AND resolved_at IS NULL`,
+		now,
+		"silence|"+id,
+	); err != nil {
+		return err
+	}
+	err = tx.Commit()
 	return err
 }
 

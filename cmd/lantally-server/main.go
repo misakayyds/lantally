@@ -2,16 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/misakayyds/lantally/internal/collector/direct"
 	"github.com/misakayyds/lantally/internal/ingest"
 	"github.com/misakayyds/lantally/internal/server"
 	"github.com/misakayyds/lantally/internal/store/metrics"
@@ -50,32 +55,55 @@ func main() {
 		log.Print("seeded synthetic demo traffic")
 	}
 
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
 	go func() {
+		defer bgWG.Done()
 		run := func() {
+			if signalCtx.Err() != nil {
+				return
+			}
 			now := time.Now().UTC()
-			if err := store.MaintainLedgers(context.Background(), now); err != nil {
+			if err := store.MaintainLedgers(signalCtx, now); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("ledger maintenance: %v", err)
 			}
 		}
 		run()
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			run()
+		for {
+			select {
+			case <-signalCtx.Done():
+				return
+			case <-ticker.C:
+				run()
+			}
 		}
 	}()
 
 	go func() {
+		defer bgWG.Done()
 		run := func() {
-			if err := store.EvaluateAlerts(context.Background(), time.Now().UTC()); err != nil {
+			if signalCtx.Err() != nil {
+				return
+			}
+			if err := store.EvaluateAlerts(signalCtx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("alert evaluation: %v", err)
 			}
 		}
 		run()
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			run()
+		for {
+			select {
+			case <-signalCtx.Done():
+				return
+			case <-ticker.C:
+				run()
+			}
 		}
 	}()
 
@@ -96,11 +124,39 @@ func main() {
 		cfg.Metrics = metrics.NewWriter(endpoint, nil)
 	}
 
+	directMgr := direct.NewManager(store, direct.Config{Metrics: cfg.Metrics})
+	if err := directMgr.Start(signalCtx); err != nil {
+		log.Fatal(err)
+	}
+	defer directMgr.Close()
+	cfg.Direct = directMgr
+
 	httpServer := &http.Server{
 		Addr:              *listenAddr,
 		Handler:           server.Routes(store, cfg),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("lantally-server listening on %s", *listenAddr)
-	log.Fatal(httpServer.ListenAndServe())
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("lantally-server listening on %s", *listenAddr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err := <-errCh:
+		stopSignals()
+		bgWG.Wait()
+		if err != nil {
+			log.Fatal(err)
+		}
+	case <-signalCtx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+		_ = directMgr.Shutdown(shutdownCtx)
+		bgWG.Wait()
+	}
 }

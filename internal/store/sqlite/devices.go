@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"strings"
 	"time"
 
@@ -16,23 +17,32 @@ func (s *Store) SetMultiplier(ctx context.Context, name string, factor float64) 
 	if name == "" {
 		return errors.New("outbound name is required")
 	}
-	if factor <= 0 {
+	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
 		return errors.New("factor must be greater than zero")
 	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO outbound_multipliers (name, factor, updated_at)
-		 VALUES (?, ?, ?)
-		 ON CONFLICT(name) DO UPDATE SET factor = excluded.factor, updated_at = excluded.updated_at`,
+		`INSERT INTO multiplier_rules (name, match_type, pattern, factor, priority, enabled, updated_at)
+		 VALUES (?, 'exact', ?, ?, 100, 1, ?)
+		 ON CONFLICT(match_type, pattern) WHERE match_type = 'exact'
+		 DO UPDATE SET name = excluded.name, factor = excluded.factor, priority = 100, enabled = 1, updated_at = excluded.updated_at`,
+		name,
 		name,
 		factor,
-		time.Now().UTC().Format(time.RFC3339Nano),
+		now,
 	)
 	return err
 }
 
 func (s *Store) ListMultipliers(ctx context.Context) (map[string]float64, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, factor FROM outbound_multipliers ORDER BY name`)
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT pattern, factor
+		 FROM multiplier_rules
+		 WHERE enabled = 1 AND match_type = 'exact'
+		 ORDER BY pattern`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -51,23 +61,87 @@ func (s *Store) ListMultipliers(ctx context.Context) (map[string]float64, error)
 }
 
 func (s *Store) ListOutboundLedgers(ctx context.Context) ([]OutboundLedger, error) {
-	multipliers, err := s.ListMultipliers(ctx)
+	return s.ListOutboundLedgersInRange(ctx, time.Time{}, time.Time{}, "")
+}
+
+func (s *Store) ListOutboundLedgersInRange(
+	ctx context.Context,
+	from, to time.Time,
+	nodeID string,
+) ([]OutboundLedger, error) {
+	rules, err := s.CompiledMultiplierRules(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	var args []any
+	var where []string
+	where = append(where, "device_id = ''", "outbound != ''")
+	if strings.TrimSpace(nodeID) != "" {
+		where = append(where, "node_id = ?")
+		args = append(args, strings.TrimSpace(nodeID))
+	}
+	baseWhere := strings.Join(where, " AND ")
+
+	fromSQL := `ledger_totals`
+	whereSQL := baseWhere
+	var rangeArgs []any
+	if !from.IsZero() && !to.IsZero() {
+		if to.Before(from) {
+			return []OutboundLedger{}, nil
+		}
+		fromUnix := from.UTC().Unix()
+		toUnix := to.UTC().Unix()
+		fromDay := (fromUnix / daySeconds) * daySeconds
+		if to.Sub(from) > range7d {
+			fromSQL = `ledger_daily`
+			whereSQL = baseWhere + ` AND day >= ? AND day <= ?`
+			rangeArgs = append(rangeArgs, args...)
+			rangeArgs = append(rangeArgs, fromDay, toUnix)
+		} else {
+			fromSQL = `(
+				SELECT outbound, class, rx, tx
+				FROM ledger_samples
+				WHERE ` + baseWhere + ` AND sampled_at >= ? AND sampled_at <= ?
+				UNION ALL
+				SELECT outbound, class, rx, tx
+				FROM ledger_daily d
+				WHERE ` + baseWhere + ` AND d.day >= ? AND d.day <= ?
+				  AND NOT EXISTS (
+					SELECT 1 FROM ledger_samples s
+					WHERE s.sampled_at >= d.day AND s.sampled_at < d.day + ?
+				  )
+			)`
+			whereSQL = `1=1`
+			rangeArgs = append(rangeArgs, args...)
+			rangeArgs = append(rangeArgs, fromUnix, toUnix)
+			rangeArgs = append(rangeArgs, args...)
+			rangeArgs = append(rangeArgs, fromDay, toUnix, daySeconds)
+		}
+	} else {
+		rangeArgs = append(rangeArgs, args...)
+	}
+
+	queryArgs := append([]any{
+		accounting.ClassProxyRaw, accounting.ClassProxyRaw,
+		accounting.ClassProxyAdjusted, accounting.ClassProxyAdjusted,
+		accounting.ClassProxyUnadjusted, accounting.ClassProxyUnadjusted,
+	}, rangeArgs...)
+
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT outbound,
-		        SUM(CASE WHEN class = ? THEN rx + tx ELSE 0 END),
-		        SUM(CASE WHEN class = ? THEN rx + tx ELSE 0 END),
-		        SUM(CASE WHEN class = ? THEN rx + tx ELSE 0 END)
-		 FROM ledger_totals
-		 WHERE device_id = '' AND outbound != ''
+		        SUM(CASE WHEN class = ? THEN rx ELSE 0 END),
+		        SUM(CASE WHEN class = ? THEN tx ELSE 0 END),
+		        SUM(CASE WHEN class = ? THEN rx ELSE 0 END),
+		        SUM(CASE WHEN class = ? THEN tx ELSE 0 END),
+		        SUM(CASE WHEN class = ? THEN rx ELSE 0 END),
+		        SUM(CASE WHEN class = ? THEN tx ELSE 0 END)
+		 FROM `+fromSQL+`
+		 WHERE `+whereSQL+`
 		 GROUP BY outbound
 		 ORDER BY outbound`,
-		accounting.ClassProxyRaw,
-		accounting.ClassProxyAdjusted,
-		accounting.ClassProxyUnadjusted,
+		queryArgs...,
 	)
 	if err != nil {
 		return nil, err
@@ -78,29 +152,54 @@ func (s *Store) ListOutboundLedgers(ctx context.Context) ([]OutboundLedger, erro
 	var rawTotal uint64
 	for rows.Next() {
 		var name string
-		var raw, adjusted, unadjusted int64
-		if err := rows.Scan(&name, &raw, &adjusted, &unadjusted); err != nil {
+		var rawRx, rawTx, legAdjRx, legAdjTx, legUnadjRx, legUnadjTx int64
+		if err := rows.Scan(&name, &rawRx, &rawTx, &legAdjRx, &legAdjTx, &legUnadjRx, &legUnadjTx); err != nil {
 			return nil, err
 		}
-		if raw < 0 {
-			raw = 0
+		uRawRx := clampUint64(rawRx)
+		uRawTx := clampUint64(rawTx)
+		uRaw := uRawRx + uRawTx
+
+		m := rules.Match(name)
+		adjRx := accounting.ScaleBytes(uRawRx, m.Factor)
+		adjTx := accounting.ScaleBytes(uRawTx, m.Factor)
+		var unadj uint64
+		if m.MatchSource == accounting.SourceDefault {
+			unadj = uRaw
 		}
-		if adjusted < 0 {
-			adjusted = 0
+		if uRaw == 0 {
+			uLegAdjRx := clampUint64(legAdjRx)
+			uLegAdjTx := clampUint64(legAdjTx)
+			uLegUnadj := clampUint64(legUnadjRx) + clampUint64(legUnadjTx)
+			if uLegAdjRx+uLegAdjTx == 0 && uLegUnadj == 0 {
+				continue
+			}
+			adjRx = uLegAdjRx
+			adjTx = uLegAdjTx
+			unadj = uLegUnadj
 		}
-		if unadjusted < 0 {
-			unadjusted = 0
-		}
-		factor, configured := multipliers[name]
+
 		ledgers = append(ledgers, OutboundLedger{
-			Name:       name,
-			Raw:        uint64(raw),
-			Factor:     factor,
-			Adjusted:   uint64(adjusted),
-			Unadjusted: uint64(unadjusted),
-			Configured: configured,
+			Name:            name,
+			Rx:              uRawRx,
+			Tx:              uRawTx,
+			Total:           uRaw,
+			Raw:             uRaw,
+			RawRx:           uRawRx,
+			RawTx:           uRawTx,
+			Factor:          m.Factor,
+			Adjusted:        adjRx + adjTx,
+			AdjustedRx:      adjRx,
+			AdjustedTx:      adjTx,
+			Unadjusted:      unadj,
+			Configured:      m.MatchSource == accounting.SourceRule,
+			MatchSource:     string(m.MatchSource),
+			MatchedRule:     m.MatchedRuleName,
+			MatchedRuleID:   m.MatchedRuleID,
+			MatchedRuleName: m.MatchedRuleName,
+			MatchedType:     string(m.MatchedType),
 		})
-		rawTotal += uint64(raw)
+		rawTotal += uRaw
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -114,6 +213,13 @@ func (s *Store) ListOutboundLedgers(ctx context.Context) ([]OutboundLedger, erro
 		ledgers = []OutboundLedger{}
 	}
 	return ledgers, nil
+}
+
+func clampUint64(v int64) uint64 {
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
 }
 
 func (s *Store) RenameDevice(ctx context.Context, id, name string) error {
@@ -137,7 +243,11 @@ func (s *Store) RenameDevice(ctx context.Context, id, name string) error {
 }
 
 func (s *Store) GetDevice(ctx context.Context, id string) (DeviceLedger, []string, error) {
-	devices, err := s.ListDeviceLedgers(ctx)
+	return s.GetDeviceInRange(ctx, id, time.Time{}, time.Time{})
+}
+
+func (s *Store) GetDeviceInRange(ctx context.Context, id string, from, to time.Time) (DeviceLedger, []string, error) {
+	devices, err := s.ListDeviceLedgersInRange(ctx, from, to)
 	if err != nil {
 		return DeviceLedger{}, nil, err
 	}

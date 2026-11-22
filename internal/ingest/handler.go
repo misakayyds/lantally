@@ -19,8 +19,9 @@ import (
 )
 
 type Handler struct {
-	store   *sqlitestore.Store
-	metrics *metrics.Writer
+	store    *sqlitestore.Store
+	metrics  *metrics.Writer
+	nodeOpts accounting.NodeOptions
 }
 
 func NewHandler(store *sqlitestore.Store) *Handler {
@@ -29,6 +30,10 @@ func NewHandler(store *sqlitestore.Store) *Handler {
 
 func (h *Handler) SetMetrics(writer *metrics.Writer) {
 	h.metrics = writer
+}
+
+func (h *Handler) SetNodeOptions(opts accounting.NodeOptions) {
+	h.nodeOpts = opts
 }
 
 func Routes(store *sqlitestore.Store) http.Handler {
@@ -100,7 +105,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if err := h.account(r.Context(), batch); err != nil {
+	if _, err := h.IngestBatch(r.Context(), batch); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
@@ -110,13 +115,21 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		Status    string `json:"status"`
-		Duplicate bool   `json:"duplicate"`
-	}{
-		Status:    "ok",
-		Duplicate: !inserted,
-	})
+	collectDomains, watchDomains, err := h.store.NodeDomainPreferences(r.Context(), batch.NodeID)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	resp := protocol.IngestResponse{
+		Status:       "ok",
+		Duplicate:    !inserted,
+		WatchDomains: watchDomains,
+	}
+	if collectDomains {
+		v := true
+		resp.CollectDomains = &v
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
@@ -128,12 +141,10 @@ func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "ok\n")
 }
 
-func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
-	multipliers, err := h.store.ListMultipliers(ctx)
-	if err != nil {
-		return err
-	}
-	increments := accounting.NodeIncrements(batch, multipliers)
+// IngestBatch applies node, device, dimension, proxy catalog, provider, and optional
+// VictoriaMetrics updates idempotently for any Batch (agent or direct collector).
+func (h *Handler) IngestBatch(ctx context.Context, batch protocol.Batch) (bool, error) {
+	increments := accounting.NodeIncrementsWithOptions(batch, nil, h.effectiveNodeOptions(batch.Metadata))
 	resolver := identity.NewResolver(h.store, batch.NodeID)
 	for _, obs := range batch.Devices {
 		deviceID, _, err := resolver.Resolve(batch.SiteID, obs, batch.SampledAt)
@@ -141,11 +152,45 @@ func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
 			if errors.Is(err, identity.ErrConflictingEvidence) {
 				continue
 			}
-			return err
+			return false, err
 		}
-		increments = append(increments, accounting.DeviceIncrements(obs, deviceID, multipliers)...)
+		increments = append(increments, accounting.DeviceIncrements(obs, deviceID, nil)...)
 	}
-	applied, err := h.store.ApplyLedgerOnce(
+
+	dims := make([]sqlitestore.DimensionIncrement, 0, len(batch.Dimensions)+len(batch.Interfaces))
+	hasIfaceDim := false
+	for _, d := range batch.Dimensions {
+		if d.Type == protocol.DimIface {
+			hasIfaceDim = true
+		}
+		if d.RxDelta == 0 && d.TxDelta == 0 {
+			continue
+		}
+		if strings.TrimSpace(d.Key) == "" {
+			continue
+		}
+		dims = append(dims, sqlitestore.DimensionIncrement{
+			Type: string(d.Type),
+			Key:  d.Key,
+			Rx:   d.RxDelta,
+			Tx:   d.TxDelta,
+		})
+	}
+	if !hasIfaceDim {
+		for _, inc := range accounting.IfaceIncrements(batch.Interfaces) {
+			if inc.Rx == 0 && inc.Tx == 0 {
+				continue
+			}
+			dims = append(dims, sqlitestore.DimensionIncrement{
+				Type: string(protocol.DimIface),
+				Key:  inc.Iface,
+				Rx:   inc.Rx,
+				Tx:   inc.Tx,
+			})
+		}
+	}
+
+	applied, err := h.store.ApplyLedgerWithDimensionsOnce(
 		ctx,
 		batch.SiteID,
 		batch.NodeID,
@@ -153,9 +198,22 @@ func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
 		batch.Sequence,
 		batch.SampledAt,
 		increments,
+		dims,
 	)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if applied {
+		if entries := collectProxyCatalogEntries(batch); len(entries) > 0 {
+			if err := h.store.UpsertProxyNodeCatalog(ctx, batch.NodeID, entries, batch.SampledAt); err != nil {
+				return false, err
+			}
+		}
+		if len(batch.Providers) > 0 {
+			if err := h.store.UpsertMihomoProviders(ctx, batch.NodeID, batch.Providers, batch.SampledAt); err != nil {
+				return false, err
+			}
+		}
 	}
 	if applied && h.metrics != nil {
 		totals, totalsErr := h.store.NodeLedgerTotals(ctx, batch.SiteID, batch.NodeID)
@@ -163,7 +221,54 @@ func (h *Handler) account(ctx context.Context, batch protocol.Batch) error {
 			_ = h.metrics.Write(ctx, ledgerSamples(batch.SiteID, batch.NodeID, totals))
 		}
 	}
-	return nil
+	return applied, nil
+}
+
+func collectProxyCatalogEntries(batch protocol.Batch) []sqlitestore.ProxyNodeCatalogEntry {
+	byName := map[string]sqlitestore.ProxyNodeCatalogEntry{}
+	add := func(name, providerName string) {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" || isBuiltinProxyName(trimmed) {
+			return
+		}
+		cur, exists := byName[trimmed]
+		if !exists || (cur.ProviderName == "" && providerName != "") {
+			byName[trimmed] = sqlitestore.ProxyNodeCatalogEntry{
+				Name:         trimmed,
+				ProviderName: strings.TrimSpace(providerName),
+			}
+		}
+	}
+	for _, p := range batch.Providers {
+		for _, member := range p.Proxies {
+			add(member, p.Name)
+		}
+	}
+	for _, name := range batch.ProxyNodes {
+		add(name, "")
+	}
+	if batch.Proxy != nil {
+		for _, ob := range batch.Proxy.ByOutbound {
+			add(ob.Name, "")
+		}
+	}
+	if len(byName) == 0 {
+		return nil
+	}
+	entries := make([]sqlitestore.ProxyNodeCatalogEntry, 0, len(byName))
+	for _, entry := range byName {
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+func isBuiltinProxyName(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) observeNode(ctx context.Context, batch protocol.Batch, inserted bool) error {
@@ -189,7 +294,6 @@ func (h *Handler) observeNode(ctx context.Context, batch protocol.Batch, inserte
 				return err
 			}
 		}
-		return nil
 	}
 	for _, gap := range batch.Gaps {
 		rec, fired := alert.EvalReset(false, string(gap.Reason))
@@ -250,4 +354,28 @@ func validJSONContentType(header string) bool {
 
 func isGzip(raw []byte) bool {
 	return len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b
+}
+
+func (h *Handler) effectiveNodeOptions(metadata json.RawMessage) accounting.NodeOptions {
+	if h.nodeOpts.ExcludeIfacePrefixes != nil || len(h.nodeOpts.IncludeIfaces) > 0 {
+		return h.nodeOpts
+	}
+	if len(metadata) == 0 {
+		return accounting.NodeOptions{}
+	}
+	var meta struct {
+		IfaceExcludePrefixes *[]string `json:"iface_exclude_prefixes"`
+		IfaceInclude         []string  `json:"iface_include"`
+	}
+	if err := json.Unmarshal(metadata, &meta); err != nil {
+		return accounting.NodeOptions{}
+	}
+	var opts accounting.NodeOptions
+	if meta.IfaceExcludePrefixes != nil {
+		opts.ExcludeIfacePrefixes = *meta.IfaceExcludePrefixes
+	}
+	if len(meta.IfaceInclude) > 0 {
+		opts.IncludeIfaces = meta.IfaceInclude
+	}
+	return opts
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/misakayyds/lantally/internal/identity"
@@ -327,6 +328,14 @@ func (s *Store) MergeIdentities(
 	value string,
 	now time.Time,
 ) (err error) {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return fmt.Errorf("%w: device id is required", ErrInvalidInput)
+	}
+	if a == b {
+		return fmt.Errorf("%w: cannot merge identity with itself", ErrInvalidInput)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err

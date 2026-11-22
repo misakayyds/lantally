@@ -15,7 +15,7 @@
       "id": "conn-proxy-1",
       "upload": 200,
       "download": 800,
-      "chains": ["PROXY", "ss-test"],
+      "chains": ["ss-test", "PROXY"],
       "rule": "Match",
       "rulePayload": "GEOSITE,CN"
     },
@@ -23,7 +23,7 @@
       "id": "conn-proxy-2",
       "upload": 100,
       "download": 400,
-      "chains": ["PROXY", "ss-test"],
+      "chains": ["ss-test", "PROXY"],
       "rule": "Match",
       "rulePayload": "GEOSITE,CN"
     }

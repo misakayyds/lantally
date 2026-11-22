@@ -8,7 +8,7 @@ import (
 	"github.com/misakayyds/lantally/internal/protocol"
 )
 
-func readProcNetDev() ([]protocol.IfaceDelta, error) {
+func readInterfaces() ([]protocol.IfaceDelta, error) {
 	f, err := os.Open("/proc/net/dev")
 	if err != nil {
 		return nil, err

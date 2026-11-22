@@ -1,6 +1,16 @@
+FROM node:22-bookworm-slim AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/index.html web/tsconfig.json web/vite.config.ts ./
+COPY web/src ./src
+RUN npm run build
+
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY . .
+RUN rm -rf ./web/dist
+COPY --from=web /src/web/dist ./web/dist
 ARG VERSION=0.1.0-dev
 ARG COMMIT=unknown
 ARG DATE=unknown
@@ -17,6 +27,7 @@ RUN LDFLAGS="-s -w -X github.com/misakayyds/lantally/internal/version.Version=${
       /out/agents/darwin/amd64 \
       /out/agents/darwin/arm64 \
       /out/agents/windows/amd64 \
+      /out/agents/windows/arm64 \
  && GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/linux/amd64/lantally-agent ./cmd/lantally-agent \
  && GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/linux/arm64/lantally-agent ./cmd/lantally-agent \
  && GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/linux/arm/lantally-agent ./cmd/lantally-agent \
@@ -24,7 +35,8 @@ RUN LDFLAGS="-s -w -X github.com/misakayyds/lantally/internal/version.Version=${
  && GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/linux/mipsle/lantally-agent ./cmd/lantally-agent \
  && GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/darwin/amd64/lantally-agent ./cmd/lantally-agent \
  && GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/darwin/arm64/lantally-agent ./cmd/lantally-agent \
- && GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/windows/amd64/lantally-agent.exe ./cmd/lantally-agent
+ && GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/windows/amd64/lantally-agent.exe ./cmd/lantally-agent \
+ && GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/windows/arm64/lantally-agent.exe ./cmd/lantally-agent
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -34,4 +46,4 @@ COPY --from=build /out/agents /usr/share/lantally/agents
 ENV LANTALLY_AGENT_DIR=/usr/share/lantally/agents
 VOLUME ["/var/lib/lantally"]
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/lantally-allinone"]
+ENTRYPOINT ["/usr/local/bin/lantally-server"]
