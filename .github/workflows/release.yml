@@ -28,6 +28,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
@@ -79,12 +84,19 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           IMAGE: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
         run: |
-          cat > /tmp/release-notes.md <<EOF
-          Install: docker run -d -p 8080:8080 -v lantally:/var/lib/lantally ${IMAGE}
-
-          Open the UI, set an admin password, then add a node with the one-line claim command.
-          Public deployments must sit behind HTTPS. Ingest protocol_version remains 1.
-          EOF
+          {
+            echo "### Quick Start"
+            echo ""
+            echo '```bash'
+            echo "docker run -d --name lantally -p 8080:8080 -v lantally:/var/lib/lantally ${IMAGE}"
+            echo '```'
+            echo ""
+            echo 'Open `http://<host>:8080`, set the admin password, and connect a local/LAN Clash or Mihomo controller via **Direct Collectors** (agentless) or deploy a lightweight **Agent** with a one-time claim code.'
+            echo ""
+            echo "- Public deployments must sit behind an HTTPS reverse proxy."
+            echo '- Ingest `protocol_version` remains `1` (backward-compatible with v0.1 agents).'
+          } > /tmp/release-notes.md
           gh release create "${RELEASE_TAG}" dist/release/* \
             --title "LanTally ${RELEASE_TAG}" \
-            --notes-file /tmp/release-notes.md
+            --notes-file /tmp/release-notes.md \
+            --generate-notes
