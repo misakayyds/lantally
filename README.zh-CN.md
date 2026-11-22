@@ -21,7 +21,20 @@
 > [!IMPORTANT]
 > **只观察、只记账、不对网路做任何写操作**：LanTally 绝不修改路由表、不碰防火墙、不改代理策略、不支持远程执行命令，所有流量数据留在你自己的容器或硬盘里。
 
-![合成 72 小时流量趋势预览](docs/screenshots/overview-synthetic.svg)
+![全景概览与置顶关注项看板](docs/screenshots/overview-live.png)
+
+<details open>
+<summary><strong>更多实机界面预览（代理倍率 / 多机场对账 / 自定义关注项 / 域名排行）</strong></summary>
+
+<br />
+
+| 落地出口 (`chains[0]`) 与倍率明细 | 动态倍率规则、实时预览与多机场订阅对账 |
+| :---: | :---: |
+| ![代理出口与倍率明细](docs/screenshots/proxy-multipliers.png) | ![倍率规则与多机场对账](docs/screenshots/providers-reconciliation.png) |
+| **自定义关注项配额与回溯趋势** | **应用进程与按需开启的主域名排行** |
+| ![自定义关注项看板](docs/screenshots/watchlist-live.png) | ![应用与主域名排行](docs/screenshots/apps-domains.png) |
+
+</details>
 
 ---
 

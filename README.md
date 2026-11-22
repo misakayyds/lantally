@@ -21,7 +21,20 @@
 > [!IMPORTANT]
 > **Observe & reconcile only—zero network mutations**: LanTally never modifies routes, firewall rules, DHCP, or proxy policies, and contains no remote command execution channel. All traffic ledgers stay on your own volume.
 
-![Synthetic 72-hour traffic preview](docs/screenshots/overview-synthetic.svg)
+![Overview dashboard and pinned watchlist quotas](docs/screenshots/overview-live.png)
+
+<details open>
+<summary><strong>More Live UI Screenshots (Exit Node Multipliers / Multi-Provider Quotas / Custom Watchlist / Domain Ranking)</strong></summary>
+
+<br />
+
+| Exit Nodes (`chains[0]`) & Multipliers | Multiplier Rules, Live Preview & Provider Quotas |
+| :---: | :---: |
+| ![Exit nodes and multipliers](docs/screenshots/proxy-multipliers.png) | ![Multiplier rules and provider reconciliation](docs/screenshots/providers-reconciliation.png) |
+| **Custom Watchlist Quotas & Retroactive Trend** | **Process & Opt-In Registered Domain Ranking** |
+| ![Custom Watchlist](docs/screenshots/watchlist-live.png) | ![Apps and Domains](docs/screenshots/apps-domains.png) |
+
+</details>
 
 ---
 
