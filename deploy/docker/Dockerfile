@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS web
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -6,7 +6,7 @@ COPY web/index.html web/tsconfig.json web/vite.config.ts ./
 COPY web/src ./src
 RUN npm run build
 
-FROM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN rm -rf ./web/dist
@@ -16,8 +16,6 @@ ARG COMMIT=unknown
 ARG DATE=unknown
 ENV CGO_ENABLED=0
 RUN LDFLAGS="-s -w -X github.com/misakayyds/lantally/internal/version.Version=${VERSION} -X github.com/misakayyds/lantally/internal/version.Commit=${COMMIT} -X github.com/misakayyds/lantally/internal/version.Date=${DATE}" \
- && go build -trimpath -ldflags "$LDFLAGS" -o /out/lantally-server ./cmd/lantally-server \
- && go build -trimpath -ldflags "$LDFLAGS" -o /out/lantally-allinone ./cmd/lantally-allinone \
  && mkdir -p \
       /out/agents/linux/amd64 \
       /out/agents/linux/arm64 \
@@ -37,6 +35,12 @@ RUN LDFLAGS="-s -w -X github.com/misakayyds/lantally/internal/version.Version=${
  && GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/darwin/arm64/lantally-agent ./cmd/lantally-agent \
  && GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/windows/amd64/lantally-agent.exe ./cmd/lantally-agent \
  && GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o /out/agents/windows/arm64/lantally-agent.exe ./cmd/lantally-agent
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN LDFLAGS="-s -w -X github.com/misakayyds/lantally/internal/version.Version=${VERSION} -X github.com/misakayyds/lantally/internal/version.Commit=${COMMIT} -X github.com/misakayyds/lantally/internal/version.Date=${DATE}" \
+ && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "$LDFLAGS" -o /out/lantally-server ./cmd/lantally-server \
+ && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "$LDFLAGS" -o /out/lantally-allinone ./cmd/lantally-allinone
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
