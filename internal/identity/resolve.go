@@ -137,6 +137,12 @@ func buildEvidence(
 		if hardwareAddr[0]&0x02 != 0 {
 			limitation = "locally administered MAC; matched by exact value only"
 		}
+	} else if obs.Source == protocol.SourceMihomo {
+		evidence = append(evidence, Evidence{
+			Rank:  RankScopedIP,
+			Value: fmt.Sprintf("%s|%s", nodeID, ip.String()),
+		})
+		limitation = "source IP scoped to site and node"
 	} else {
 		evidence = append(evidence, Evidence{
 			Rank:  RankScopedIP,

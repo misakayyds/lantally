@@ -105,6 +105,10 @@ func Open(dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 10000`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if existing {
 		version, err := sqliteUserVersion(db)
 		if err != nil {
@@ -118,6 +122,10 @@ func Open(dsn string) (*Store, error) {
 			}
 		}
 	}
+	if err := configureSQLitePragmas(db, dsn); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := applyMigrations(db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -125,6 +133,9 @@ func Open(dsn string) (*Store, error) {
 	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if !isMemoryDSN(dsn) {
+		_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
 	}
 	secretKey, err := loadOrCreateSecretKey(dsn)
 	if err != nil {
@@ -135,8 +146,29 @@ func Open(dsn string) (*Store, error) {
 	return store, nil
 }
 
+func configureSQLitePragmas(db *sql.DB, dsn string) error {
+	pragmas := []string{
+		`PRAGMA busy_timeout = 10000`,
+		`PRAGMA temp_store = MEMORY`,
+	}
+	if !isMemoryDSN(dsn) {
+		pragmas = append(pragmas,
+			`PRAGMA journal_mode = WAL`,
+			`PRAGMA synchronous = NORMAL`,
+			`PRAGMA cache_size = -16000`,
+			`PRAGMA wal_autocheckpoint = 2000`,
+		)
+	}
+	for _, stmt := range pragmas {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("apply sqlite pragma %q: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
 func fileDSNSize(dsn string) int64 {
-	if dsn == "" || dsn == ":memory:" || strings.Contains(dsn, "mode=memory") {
+	if isMemoryDSN(dsn) {
 		return 0
 	}
 	info, err := os.Stat(dsn)
@@ -380,6 +412,12 @@ func tableHasColumn(db *sql.DB, table, column string) (bool, error) {
 }
 
 func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	if !isMemoryDSN(s.databasePath) {
+		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	}
 	// Drop idle connections so Windows can unlink the TempDir database.
 	s.db.SetMaxIdleConns(0)
 	return s.db.Close()
@@ -765,9 +803,27 @@ func (s *Store) InsertBatch(
 }
 
 func (s *Store) BatchCount(ctx context.Context) (int, error) {
-	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ingest_batches`).Scan(&count)
-	return count, err
+	var ingestCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ingest_batches`).Scan(&ingestCount); err != nil {
+		return 0, err
+	}
+	if ingestCount == 0 {
+		var appliedCount int
+		err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ledger_applied`).Scan(&appliedCount)
+		return appliedCount, err
+	}
+	var directOnly int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM ledger_applied la
+		 WHERE NOT EXISTS (
+			SELECT 1 FROM ingest_batches ib
+			WHERE ib.node_id = la.node_id AND ib.boot_id = la.boot_id AND ib.sequence = la.sequence
+		 )`,
+	).Scan(&directOnly); err != nil {
+		return 0, err
+	}
+	return ingestCount + directOnly, nil
 }
 
 func (s *Store) BatchPayloadHash(

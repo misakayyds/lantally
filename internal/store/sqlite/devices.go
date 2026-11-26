@@ -290,45 +290,62 @@ func (s *Store) attachDeviceEvidence(ctx context.Context, devices []DeviceLedger
 	if len(devices) == 0 {
 		return nil
 	}
-	index := map[string]int{}
-	args := make([]any, 0, len(devices))
-	placeholders := make([]string, 0, len(devices))
+	index := make(map[string]int, len(devices))
 	for i, device := range devices {
 		index[device.ID] = i
-		args = append(args, device.ID)
-		placeholders = append(placeholders, "?")
 	}
-	rows, err := s.db.QueryContext(
-		ctx,
-		`SELECT device_id, evidence_rank, evidence_value
-		 FROM identity_evidence
-		 WHERE device_id IN (`+strings.Join(placeholders, ",")+`)
-		 ORDER BY observed_at DESC, id DESC`,
-		args...,
-	)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var deviceID, value string
-		var rank int
-		if err := rows.Scan(&deviceID, &rank, &value); err != nil {
+	const chunkSize = 500
+	for start := 0; start < len(devices); start += chunkSize {
+		end := start + chunkSize
+		if end > len(devices) {
+			end = len(devices)
+		}
+		chunk := devices[start:end]
+		args := make([]any, 0, len(chunk))
+		placeholders := make([]string, 0, len(chunk))
+		for _, device := range chunk {
+			args = append(args, device.ID)
+			placeholders = append(placeholders, "?")
+		}
+		rows, err := s.db.QueryContext(
+			ctx,
+			`SELECT device_id, evidence_rank, evidence_value
+			 FROM identity_evidence
+			 WHERE device_id IN (`+strings.Join(placeholders, ",")+`)
+			 ORDER BY observed_at DESC, id DESC`,
+			args...,
+		)
+		if err != nil {
 			return err
 		}
-		pos, ok := index[deviceID]
-		if !ok {
-			continue
+		for rows.Next() {
+			var deviceID, value string
+			var rank int
+			if err := rows.Scan(&deviceID, &rank, &value); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			pos, ok := index[deviceID]
+			if !ok {
+				continue
+			}
+			ip, mac := parseEvidence(identity.EvidenceRank(rank), value)
+			if devices[pos].IP == "" && ip != "" {
+				devices[pos].IP = ip
+			}
+			if devices[pos].MAC == "" && mac != "" {
+				devices[pos].MAC = mac
+			}
 		}
-		ip, mac := parseEvidence(identity.EvidenceRank(rank), value)
-		if devices[pos].IP == "" && ip != "" {
-			devices[pos].IP = ip
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
 		}
-		if devices[pos].MAC == "" && mac != "" {
-			devices[pos].MAC = mac
+		if err := rows.Close(); err != nil {
+			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func parseEvidence(rank identity.EvidenceRank, value string) (ip, mac string) {

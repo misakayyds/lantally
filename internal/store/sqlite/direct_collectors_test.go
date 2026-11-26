@@ -236,8 +236,8 @@ func TestDirectCollectorCRUDValidationNodeSyncAndSilenceFilter(t *testing.T) {
 	if dc.SiteID != "default" || !strings.HasPrefix(dc.NodeID, "dc-router-alpha-") {
 		t.Fatalf("unexpected generated defaults: site=%q node=%q", dc.SiteID, dc.NodeID)
 	}
-	if dc.PollIntervalMS != 1000 {
-		t.Fatalf("default poll_interval_ms = %d, want 1000", dc.PollIntervalMS)
+	if dc.PollIntervalMS != 15000 {
+		t.Fatalf("default poll_interval_ms = %d, want 15000", dc.PollIntervalMS)
 	}
 
 	// Verify synced node row appears in ListNodes with mode='direct' and fails Authenticate.

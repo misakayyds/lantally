@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	defaultDirectPollIntervalMS = 1000
+	defaultDirectPollIntervalMS = 15000
 	minDirectPollIntervalMS     = 200
 	maxDirectPollIntervalMS     = 300000
 )
@@ -832,7 +832,28 @@ func (s *Store) UpdateDirectCollectorStatus(ctx context.Context, id int64, seenA
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if !seenAt.IsZero() {
 		seenStr := seenAt.UTC().Format(time.RFC3339Nano)
-		if _, err := s.db.ExecContext(
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				_ = tx.Rollback()
+			}
+		}()
+		var nodeID string
+		var pollMS int
+		if err = tx.QueryRowContext(
+			ctx,
+			`SELECT node_id, poll_interval_ms FROM direct_collectors WHERE id = ?`,
+			id,
+		).Scan(&nodeID, &pollMS); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return tx.Commit()
+			}
+			return err
+		}
+		if _, err = tx.ExecContext(
 			ctx,
 			`UPDATE direct_collectors SET last_seen_at = ?, last_error = '', updated_at = ? WHERE id = ?`,
 			seenStr,
@@ -841,16 +862,24 @@ func (s *Store) UpdateDirectCollectorStatus(ctx context.Context, id int64, seenA
 		); err != nil {
 			return err
 		}
-		_, err := s.db.ExecContext(
+		if _, err = tx.ExecContext(
 			ctx,
-			`UPDATE nodes
-			 SET last_seen_at = ?,
-			     last_interval_ms = COALESCE((SELECT poll_interval_ms FROM direct_collectors WHERE id = ?), last_interval_ms)
-			 WHERE id = (SELECT node_id FROM direct_collectors WHERE id = ?)`,
+			`UPDATE nodes SET last_seen_at = ?, last_interval_ms = ? WHERE id = ?`,
 			seenStr,
-			id,
-			id,
-		)
+			pollMS,
+			nodeID,
+		); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(
+			ctx,
+			`UPDATE alerts SET resolved_at = ? WHERE fingerprint = ? AND resolved_at IS NULL`,
+			seenStr,
+			"silence|"+nodeID,
+		); err != nil {
+			return err
+		}
+		err = tx.Commit()
 		return err
 	}
 

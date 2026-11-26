@@ -51,7 +51,7 @@ export default function Nodes() {
   const [dcOrigUrl, setDcOrigUrl] = useState("");
   const [dcSecret, setDcSecret] = useState("");
   const [dcClearSecret, setDcClearSecret] = useState(false);
-  const [dcPollMs, setDcPollMs] = useState("1000");
+  const [dcPollMs, setDcPollMs] = useState("15000");
   const [dcCollectDomains, setDcCollectDomains] = useState(false);
   const [dcEnabled, setDcEnabled] = useState(true);
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
@@ -212,7 +212,7 @@ export default function Nodes() {
     setDcOrigUrl("");
     setDcSecret("");
     setDcClearSecret(false);
-    setDcPollMs("1000");
+    setDcPollMs("15000");
     setDcCollectDomains(false);
     setDcEnabled(true);
     setProbeResult(null);
@@ -228,7 +228,7 @@ export default function Nodes() {
     setDcOrigUrl(dc.url);
     setDcSecret(dc.has_secret ? "********" : "");
     setDcClearSecret(false);
-    setDcPollMs(String(dc.poll_interval_ms || 1000));
+    setDcPollMs(String(dc.poll_interval_ms || 15000));
     setDcCollectDomains(dc.collect_domains);
     setDcEnabled(dc.enabled);
     setProbeResult(null);
@@ -281,7 +281,7 @@ export default function Nodes() {
       site_id: dcSite.trim() || "default",
       ...(dcNodeId.trim() ? { node_id: dcNodeId.trim() } : {}),
       ...(!editingDc || trimmedUrl !== dcOrigUrl ? { url: trimmedUrl } : {}),
-      poll_interval_ms: Number(dcPollMs) || 1000,
+      poll_interval_ms: Number(dcPollMs) || 15000,
       collect_domains: dcCollectDomains,
       enabled: dcEnabled,
     };
@@ -805,7 +805,7 @@ export default function Nodes() {
               )}
             </div>
             <div className="field">
-              <label>{lang === "zh-CN" ? "轮询间隔 (ms)" : "Poll Interval (ms)"}</label>
+              <label>{lang === "zh-CN" ? "落盘间隔 (ms)" : "Flush Interval (ms)"}</label>
               <input
                 type="number"
                 min={200}

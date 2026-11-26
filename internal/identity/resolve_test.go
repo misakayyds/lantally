@@ -91,6 +91,28 @@ func TestResolveScopesIPOnlyIdentityToTimeWindow(t *testing.T) {
 	}
 }
 
+func TestResolveMihomoSourceIPStableAcrossHours(t *testing.T) {
+	_, resolver := openResolver(t)
+	obs := protocol.DeviceDelta{
+		ObsIP:    "192.0.2.42",
+		Source:   protocol.SourceMihomo,
+		Outbound: "proxy-a",
+	}
+
+	first, _, err := resolver.Resolve("site-a", obs, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	later, _, err := resolver.Resolve("site-a", obs, observedAt.Add(6*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first != later {
+		t.Fatalf("Mihomo sourceIP split across hours: %q != %q", first, later)
+	}
+}
+
 func TestConflictingPinsNeverMerge(t *testing.T) {
 	_, resolver := openResolver(t)
 	first := resolve(t, resolver, observation("203.0.113.40", "02:00:00:00:00:05"))

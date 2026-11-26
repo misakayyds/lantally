@@ -3,10 +3,8 @@
 package e2e
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -1068,14 +1066,7 @@ func TestTier4_Workloads(t *testing.T) {
 		}
 		srv1.Stop()
 
-		rawDB, err := os.ReadFile(dbPath)
-		if err != nil {
-			t.Fatalf("read db: %v", err)
-		}
-		binary.BigEndian.PutUint32(rawDB[60:64], 1)
-		if err := os.WriteFile(dbPath, rawDB, 0o600); err != nil {
-			t.Fatalf("write patched db: %v", err)
-		}
+		setSQLiteUserVersion(t, dbPath, 1)
 
 		srv2 := startServer(t, ServerOpts{DBPath: dbPath, MetricsURL: vm.URL()})
 		baks, err := filepath.Glob(filepath.Join(filepath.Dir(dbPath), "lantally.db.bak-*"))

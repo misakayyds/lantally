@@ -541,6 +541,15 @@ func (s *Store) ListDeviceLedgersInRange(ctx context.Context, from, to time.Time
 	if err := s.attachDeviceEvidence(ctx, devices); err != nil {
 		return nil, err
 	}
+	sort.Slice(devices, func(i, j int) bool {
+		if devices[i].Total != devices[j].Total {
+			return devices[i].Total > devices[j].Total
+		}
+		if devices[i].SiteID != devices[j].SiteID {
+			return devices[i].SiteID < devices[j].SiteID
+		}
+		return devices[i].ID < devices[j].ID
+	})
 	return devices, nil
 }
 
@@ -1040,6 +1049,103 @@ func (s *Store) TrafficSeries(ctx context.Context, query TrafficQuery) (TrafficS
 				if rawSeen == 0 && len(legacyRows) > 0 {
 					for _, lr := range legacyRows {
 						addPoint(lr.bucket, lr.key, lr.rx, lr.tx)
+					}
+				}
+			} else if query.Group == "device" && query.Class == accounting.ClassTotal {
+				// Device totals come from nlbwmon (class='total') when present, otherwise
+				// fall back to Mihomo direct + proxy_raw per (bucket, device_id) without
+				// double counting, matching ListDeviceLedgersInRange.
+				whereClass := `class IN (?, ?, ?) AND device_id != ''`
+				classArgs := []any{accounting.ClassTotal, accounting.ClassDirect, accounting.ClassProxyRaw}
+				baseCond := deviceScope(query.Group) + ` AND ` + whereClass + ` AND ` + extra
+
+				var querySQL string
+				var args []any
+				if pureDaily {
+					querySQL = `SELECT (day / ?) * ? AS bucket, device_id, class, SUM(rx), SUM(tx)
+					 FROM ledger_daily
+					 WHERE ` + baseCond + ` AND day >= ? AND day <= ?
+					 GROUP BY bucket, device_id, class
+					 ORDER BY bucket, device_id`
+					args = append(args, query.BucketSeconds, query.BucketSeconds)
+					args = append(args, classArgs...)
+					args = append(args, filterArgs...)
+					args = append(args, fromDay, toUnix)
+				} else {
+					querySQL = `SELECT bucket, k, class, SUM(rx), SUM(tx)
+					 FROM (
+						SELECT (sampled_at / ?) * ? AS bucket, device_id AS k, class, rx, tx
+						FROM ledger_samples
+						WHERE ` + baseCond + ` AND sampled_at >= ? AND sampled_at <= ?
+						UNION ALL
+						SELECT (d.day / ?) * ? AS bucket, d.device_id AS k, d.class, d.rx, d.tx
+						FROM ledger_daily d
+						WHERE ` + baseCond + ` AND d.day >= ? AND d.day <= ?
+						  AND NOT EXISTS (
+							SELECT 1 FROM ledger_samples s
+							WHERE s.sampled_at >= d.day AND s.sampled_at < d.day + ?
+						  )
+					 )
+					 GROUP BY bucket, k, class
+					 ORDER BY bucket, k`
+					args = append(args, query.BucketSeconds, query.BucketSeconds)
+					args = append(args, classArgs...)
+					args = append(args, filterArgs...)
+					args = append(args, fromUnix, toUnix)
+					args = append(args, query.BucketSeconds, query.BucketSeconds)
+					args = append(args, classArgs...)
+					args = append(args, filterArgs...)
+					args = append(args, fromDay, toUnix, daySeconds)
+				}
+
+				rows, err := s.db.QueryContext(ctx, querySQL, args...)
+				if err != nil {
+					return TrafficSeries{}, err
+				}
+				defer rows.Close()
+
+				type devBucketKey struct {
+					bucket   int64
+					deviceID string
+				}
+				type devBucketAcc struct {
+					totRx, totTx uint64
+					subRx, subTx uint64
+				}
+				devAcc := map[devBucketKey]*devBucketAcc{}
+				var devOrder []devBucketKey
+				for rows.Next() {
+					var bucket int64
+					var key, class string
+					var rx, tx int64
+					if err := rows.Scan(&bucket, &key, &class, &rx, &tx); err != nil {
+						return TrafficSeries{}, err
+					}
+					uRx, uTx := clampUint64(rx), clampUint64(tx)
+					dk := devBucketKey{bucket: bucket, deviceID: key}
+					acc := devAcc[dk]
+					if acc == nil {
+						acc = &devBucketAcc{}
+						devAcc[dk] = acc
+						devOrder = append(devOrder, dk)
+					}
+					if class == accounting.ClassTotal {
+						acc.totRx += uRx
+						acc.totTx += uTx
+					} else {
+						acc.subRx += uRx
+						acc.subTx += uTx
+					}
+				}
+				if err := rows.Err(); err != nil {
+					return TrafficSeries{}, err
+				}
+				for _, dk := range devOrder {
+					acc := devAcc[dk]
+					if acc.totRx+acc.totTx > 0 {
+						addPoint(dk.bucket, dk.deviceID, acc.totRx, acc.totTx)
+					} else if acc.subRx+acc.subTx > 0 {
+						addPoint(dk.bucket, dk.deviceID, acc.subRx, acc.subTx)
 					}
 				}
 			} else {

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -149,6 +152,27 @@ func (s *RunningServer) Stop() {
 			s.waitErr = <-s.done
 		}
 	})
+}
+
+func setSQLiteUserVersion(t *testing.T, dbPath string, target uint32) uint32 {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db %s: %v", dbPath, err)
+	}
+	defer func() { _ = db.Close() }()
+	var prev uint32
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&prev); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
+		t.Fatalf("set user_version=%d: %v", target, err)
+	}
+	_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close sqlite db %s: %v", dbPath, err)
+	}
+	return prev
 }
 
 func (s *RunningServer) Logs() string {

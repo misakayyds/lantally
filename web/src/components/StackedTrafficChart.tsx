@@ -10,6 +10,7 @@ interface StackedTrafficChartProps {
   direction?: MetricDirection;
   onDirectionChange?: (dir: MetricDirection) => void;
   rightControls?: React.ReactNode;
+  labelMap?: Record<string, string>;
 }
 
 function pointMapForDir(pt: TrafficPoint, dir: MetricDirection): Record<string, number> {
@@ -31,6 +32,7 @@ export function StackedTrafficChart({
   direction = "total",
   onDirectionChange,
   rightControls,
+  labelMap,
 }: StackedTrafficChartProps) {
   const { lang, t } = useApp();
   const [legendPage, setLegendPage] = useState(0);
@@ -49,7 +51,7 @@ export function StackedTrafficChart({
     [t],
   );
 
-  const labelFor = (key: string) => classLabels[key] || key;
+  const labelFor = (key: string) => labelMap?.[key] || classLabels[key] || key;
 
   const points = series?.points || [];
   const totals = series ? totalsForDir(series, direction) : {};
@@ -180,13 +182,19 @@ export function StackedTrafficChart({
               }
             }
 
+            let bucketTotal = 0;
+            for (const k of keys) bucketTotal += Number(m[k] || 0);
+            const rawTotalH = bucketTotal > 0 ? (bucketTotal / unit.div / yMax) * plotH : 0;
+            const visualScale = rawTotalH > 0 && rawTotalH < 2.5 ? 2.5 / rawTotalH : 1;
+
             return (
               <g key={pt.t + i}>
                 {keys.map((key) => {
                   const bytes = Number(m[key] || 0);
                   if (bytes <= 0) return null;
-                  const h = (bytes / unit.div / yMax) * plotH;
-                  const y = yBase - h;
+                  const h = ((bytes / unit.div / yMax) * plotH) * visualScale;
+                  const y = Math.max(pad.top, yBase - h);
+                  const clampedH = Math.max(0, yBase - y);
                   yBase = y;
                   return (
                     <rect
@@ -194,7 +202,7 @@ export function StackedTrafficChart({
                       x={x}
                       y={y}
                       width={barW}
-                      height={Math.max(h, 0)}
+                      height={clampedH}
                       fill={colorFor(key)}
                     />
                   );

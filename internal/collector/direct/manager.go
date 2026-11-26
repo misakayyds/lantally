@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	defaultPollInterval     = time.Second
+	defaultPollInterval     = 15 * time.Second
 	defaultMetaSyncInterval = 5 * time.Minute
 	defaultDomainTopN       = 50
 	defaultProbeTimeout     = 5 * time.Second
@@ -489,6 +489,14 @@ func (r *collectorRunner) run(ctx context.Context) {
 	warmup := time.NewTimer(warmupDelay)
 	defer warmup.Stop()
 
+	var postWarmup *time.Timer
+	var postWarmupC <-chan time.Time
+	if r.pollInterval > 2*time.Second {
+		postWarmup = time.NewTimer(1500 * time.Millisecond)
+		defer postWarmup.Stop()
+		postWarmupC = postWarmup.C
+	}
+
 	ticker := time.NewTicker(r.pollInterval)
 	defer ticker.Stop()
 
@@ -497,16 +505,19 @@ func (r *collectorRunner) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-warmup.C:
-			r.tick(ctx)
+			r.tick(ctx, false)
+		case <-postWarmupC:
+			postWarmupC = nil
+			r.tick(ctx, true)
 		case <-ticker.C:
-			r.tick(ctx)
+			r.tick(ctx, false)
 		case <-r.refreshCh:
-			r.tick(ctx)
+			r.tick(ctx, false)
 		}
 	}
 }
 
-func (r *collectorRunner) tick(ctx context.Context) {
+func (r *collectorRunner) tick(ctx context.Context, quickQuietCheck bool) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -534,12 +545,19 @@ func (r *collectorRunner) tick(ctx context.Context) {
 		r.col.SetDomainOptions(collectDomains, watchDomains)
 	}
 
-	// If WS has been quiet for at least pollInterval (e.g. controller/mock does not push idle frames),
+	// If WS has been quiet for longer than quietThreshold (e.g. controller/mock does not push idle frames),
 	// perform a single read-only GET /connections refresh without disturbing active streaming.
 	connected, streamErr := r.col.Status()
 	lastFrameAt := r.col.LastFrameAt()
+	quietThreshold := r.pollInterval
+	if quietThreshold > 5*time.Second {
+		quietThreshold = 5 * time.Second
+	}
+	if quickQuietCheck && quietThreshold > time.Second {
+		quietThreshold = time.Second
+	}
 	var pollErr error
-	if connected && !lastFrameAt.IsZero() && now.Sub(lastFrameAt) >= r.pollInterval {
+	if connected && !lastFrameAt.IsZero() && now.Sub(lastFrameAt) >= quietThreshold {
 		if err := r.col.PollOnce(ctx); err != nil && ctx.Err() == nil {
 			pollErr = err
 		}
@@ -691,7 +709,6 @@ func (r *collectorRunner) tick(ctx context.Context) {
 	metaHealthy := metaAttempted && pErr == nil && provErr == nil
 	if connected || metaHealthy {
 		_ = r.manager.store.UpdateDirectCollectorStatus(ctx, r.id, now, "")
-		_ = r.manager.store.ResolveFingerprint(ctx, "silence|"+r.nodeID, now)
 	} else if streamErr != nil {
 		r.recordError(ctx, streamErr)
 	}

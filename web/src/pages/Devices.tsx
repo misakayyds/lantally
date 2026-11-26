@@ -118,6 +118,12 @@ export default function Devices() {
     }
   };
 
+  const deviceLabel = (d: DeviceLedger) => d.name || d.ip || d.mac || d.id;
+  const deviceLabels: Record<string, string> = {};
+  for (const d of devices) {
+    deviceLabels[d.id] = deviceLabel(d);
+  }
+
   if (deviceId) {
     const dev = detail?.device;
     const candidates = devices.filter(
@@ -144,7 +150,7 @@ export default function Devices() {
               <article className="metric">
                 <div className="metric-label">{lang === "zh-CN" ? "设备名称" : "Device"}</div>
                 <div className="metric-value" style={{ fontSize: "1.25rem", fontFamily: "var(--font)" }}>
-                  {dev.name}
+                  {deviceLabel(dev)}
                 </div>
                 <div className="metric-sub mono">
                   {dev.ip || "-"} {dev.mac ? `· ${dev.mac}` : ""}
@@ -168,7 +174,7 @@ export default function Devices() {
             </div>
 
             <StackedTrafficChart
-              title={lang === "zh-CN" ? `${dev.name} 流量分类趋势` : `${dev.name} Traffic by Class`}
+              title={lang === "zh-CN" ? `${deviceLabel(dev)} 流量分类趋势` : `${deviceLabel(dev)} Traffic by Class`}
               series={detailSeries}
               direction={direction}
               onDirectionChange={setDirection}
@@ -262,6 +268,7 @@ export default function Devices() {
             series={deviceSeries}
             direction={direction}
             onDirectionChange={setDirection}
+            labelMap={deviceLabels}
           />
           <div className="card">
             <div className="card-header">
@@ -298,7 +305,7 @@ export default function Devices() {
                         onClick={() => navigate("devices", d.id)}
                       >
                         <td className="sans">
-                          <strong>{d.name}</strong>
+                          <strong>{deviceLabel(d)}</strong>
                         </td>
                         <td>{d.site_id}</td>
                         <td>

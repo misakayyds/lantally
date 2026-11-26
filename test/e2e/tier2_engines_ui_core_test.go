@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net/http"
 	"os"
@@ -913,20 +912,9 @@ func TestTier2_EnginesUICore(t *testing.T) {
 		}
 		srv1.Stop()
 
-		raw, err := os.ReadFile(dbPath)
-		if err != nil {
-			t.Fatalf("read db: %v", err)
-		}
-		if len(raw) < 100 || string(raw[:16]) != "SQLite format 3\x00" {
-			t.Fatalf("invalid sqlite header")
-		}
-		if binary.BigEndian.Uint32(raw[60:64]) < 11 {
-			t.Fatalf("unexpected user_version %d", binary.BigEndian.Uint32(raw[60:64]))
-		}
-		// Lower PRAGMA user_version (offset 60..63 big-endian) to 1 to simulate behind-schema DB.
-		binary.BigEndian.PutUint32(raw[60:64], 1)
-		if err := os.WriteFile(dbPath, raw, 0o600); err != nil {
-			t.Fatalf("write patched db: %v", err)
+		// Lower PRAGMA user_version to 1 to simulate behind-schema DB (works under WAL and DELETE).
+		if prev := setSQLiteUserVersion(t, dbPath, 1); prev < 11 {
+			t.Fatalf("unexpected user_version %d", prev)
 		}
 
 		srv2 := startServer(t, ServerOpts{DBPath: dbPath})
